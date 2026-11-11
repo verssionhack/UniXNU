@@ -7,7 +7,9 @@ import os
 import struct
 
 ARCH = os.environ.get('UNIXNU_XNU_ARCH', 'arm64')
-IOS_VERSION = os.environ.get('UNIXNU_IOS_VERSION', '17.0')
+# The Linux toolchain pins its --target (DARWIN_TRIPLE) to the iOS 17 deployment, so the kernel objects it
+# emits carry that deployment regardless of the profile's iOS version; UNIXNU_KERNEL_DEPLOYMENT overrides it.
+IOS_VERSION = os.environ.get('UNIXNU_KERNEL_DEPLOYMENT') or os.environ.get('UNIXNU_IOS_VERSION', '17.0')
 TRIPLE = f'{ARCH}-apple-ios{IOS_VERSION}'
 _major, _minor = (IOS_VERSION.split('.') + ['0'])[:2]
 DEPLOYMENT = (2, int(_major) << 16 | int(_minor) << 8)

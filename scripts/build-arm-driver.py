@@ -84,7 +84,15 @@ while index < len(arguments):
     index += 1
 command.extend(['-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
                 '-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-enum-enum-conversion',
-                '-Wno-unnecessary-virtual-specifier', '-I', str(ROOT / '.cache/xnu-work/osfmk')])
+                '-Wno-unnecessary-virtual-specifier',
+                # The compile record pairs the profile's -mios-version-min with the toolchain's
+                # pinned --target; the toolchain deployment wins and clang warns about the override.
+                '-Wno-overriding-option',
+                # xnu-12377's kalloc headers gained kt_zearly/kt_stats; clang-24 warns that the
+                # (framework) headers' own designated initializers omit them. They value-init to 0.
+                '-Wno-missing-designated-field-initializers',
+                '-Wno-unused-but-set-variable', '-Wno-unused-but-set-global',
+                '-I', str(ROOT / '.cache/xnu-work/osfmk')])
 if component in ('NativeVirtioBlock', 'NativeRamBlock', 'NativeUfs'):
     command += ['-I', str(ROOT / 'build/storage-abi/include')]
     if args.verified_root:

@@ -55,20 +55,26 @@ def build(ctx, modules, uefi, edk2, target='DEBUG'):
     # EDK II embeds the build time; pin it to the commit time so the same sources give the same firmware.
     env.setdefault('SOURCE_DATE_EPOCH', git(uefi, 'log', '-1', '--format=%ct').strip())
     applied = []
+
+    def board_patch(patch, repo):
+        path = ctx.device / patch[7:] if patch.startswith('device:') else uefi / patch
+        run(['git', '-C', repo, 'apply', '--check', path])
+        run(['git', '-C', repo, 'apply', path])
+        applied.append((repo, path))
+
     try:
-        # Board patches for the shared edk2 checkout: applied for the build, always reverted.
+        # Board patches for the shared checkouts: applied for the build, always reverted.
         for patch in fw.get('patches', []):
-            path = uefi / patch
-            run(['git', '-C', edk2, 'apply', '--check', path])
-            run(['git', '-C', edk2, 'apply', path])
-            applied.append(path)
+            board_patch(patch, edk2)
+        for patch in fw.get('uefi_patches', []):
+            board_patch(patch, uefi)
         command = ['build', '-p', fw['dsc'], '-a', 'AARCH64', '-b', target, '-t', 'CLANGPDB', '-n', str(ctx.jobs)]
         for key, value in defines.items():
             command += ['-D', f'{key}={value}']
         run(command, cwd=uefi, env=env, log_file=ctx.logs / 'firmware.log')
     finally:
-        for path in reversed(applied):
-            git(edk2, 'apply', '--reverse', str(path))
+        for repo, path in reversed(applied):
+            git(repo, 'apply', '--reverse', str(path))
     fd = fd_path(ctx, uefi, target)
     if not fd.is_file() or fd.stat().st_size != size:
         raise Error(f'{fd} missing or not {size:#x} bytes')

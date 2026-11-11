@@ -87,6 +87,11 @@
 "certificate-security-mode" = 1
 "effective-security-mode-sep" = 1
 "amfi-only-platform-code" = 1
+# iBoot normally writes this; the non-Apple SoCs have no CTRR, so the DEBUG/DTrace
+# kernel's ml_unsafe_kernel_text() must still be initialized or it asserts the first
+# time a code path asks (seen at bsd_init once the USB driver started a kernel
+# thread). 0 says the kernel text is not hardware-locked.
+"kernel-ctrr-to-be-enabled" = 0
 
 
 # The local boot policy csr_bootstrap reads (kern_csr.c): lp-sip0 keeps every SIP protection on, lp-sip1 adds

@@ -8,6 +8,7 @@ import concurrent.futures
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import platform
 import subprocess
@@ -109,7 +110,8 @@ def compile_one(source):
             'diagnostic': result.stdout[-2500:] if result.returncode else None}
 
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+workers = int(os.environ.get('JOBS', 0)) or os.cpu_count() or 4
+with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
     results = list(executor.map(compile_one, sources))
 failed = [result for result in results if result['exit_code']]
 report = {'source_url': 'https://github.com/ONLYA/corecrypto-2023', 'source_revision': REVISION,

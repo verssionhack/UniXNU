@@ -9,6 +9,7 @@
 Each rewrite checks whether it is still needed, so both modes can run on every build.
 """
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import sys
@@ -108,8 +109,14 @@ def build_cc_kext():
     # -mkernel, KERNEL_USE). The builtins half is left out: the kernel link needs none of it. KERNEL_USE selects the
     # kernel headers (Kernel.framework); inttypes.h, stdio.h and gethostuuid.h come from Libc and Libsyscall, as they
     # do from an SDK's usr/include.
+    # ld ignores an archive whose members' architecture differs from the kernel's, so the archive is built for the
+    # selected kernel architecture (arm64e for the macOS profiles) rather than a fixed arm64.
+    arch = os.environ.get('UNIXNU_XNU_ARCH', 'arm64')
+    version = os.environ.get('UNIXNU_KERNEL_DEPLOYMENT') or os.environ.get('UNIXNU_IOS_VERSION', '17.0')
     out = FAKEROOT / 'usr/local/lib/kernel/libcc_kext.a'
-    if out.is_file():
+    stamp = out.with_suffix('.arch')
+    identity = f'{arch}-apple-ios{version}'
+    if out.is_file() and stamp.is_file() and stamp.read_text() == identity:
         return
     src = ROOT / '.cache/linux'
     fetch(src / 'llvm-project', 'https://github.com/llvm/llvm-project', LLVM_COMMIT,
@@ -120,14 +127,15 @@ def build_cc_kext():
     objects.mkdir(parents=True, exist_ok=True)
     out.parent.mkdir(parents=True, exist_ok=True)
     for name in PROFILE_SOURCES:
-        subprocess.run(['xcrun', 'clang', '-target', 'arm64-apple-ios17.0', '-arch', 'arm64', '-isysroot', FAKEROOT,
+        subprocess.run(['xcrun', 'clang', '-target', identity, '-arch', arch, '-isysroot', FAKEROOT,
                         '-mkernel', '-DKERNEL_USE', '-O3', '-fPIC', '-w',
                         '-I', rt / 'include', '-I', FAKEROOT / 'System/Library/Frameworks/Kernel.framework/Headers',
                         '-idirafter', src / 'Libc/include', '-idirafter', XNU / 'libsyscall/wrappers',
                         '-c', rt / f'lib/profile/{name}.c', '-o', objects / f'{name}.o'], check=True)
     subprocess.run(['xcrun', 'libtool', '-static', '-o', out, *(objects / f'{n}.o' for n in PROFILE_SOURCES)],
                    check=True)
-    info(f'libcc_kext.a: {out}')
+    stamp.write_text(identity)
+    info(f'libcc_kext.a ({identity}): {out}')
 
 
 if __name__ == '__main__':
