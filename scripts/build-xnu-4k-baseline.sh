@@ -190,16 +190,19 @@ CRYPTO_OBJECT_DIR=$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELO
 if [ -d "$CRYPTO_OBJECT_DIR" ]; then
   if [ "$(cat "$CRYPTO_OBJECT_DIR/.crypto-bootstrap-mode" 2>/dev/null || echo source)" != "$CRYPTO_BOOTSTRAP_MODE" ]; then
     rm -f "$CRYPTO_OBJECT_DIR/prng_random.o"
+    rm -f "$ROOT/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/libkern/DEVELOPMENT/OSKext.cpo"
   fi
   printf '%s\n' "$CRYPTO_BOOTSTRAP_MODE" > "$CRYPTO_OBJECT_DIR/.crypto-bootstrap-mode"
 fi
 if [ "$CRYPTO_BOOTSTRAP_MODE" = prelinked ]; then
   # The original component must initialize through real OSKext startup.
-  # Only this source-provider entry is omitted; no POST or missing-provider
-  # failure is suppressed, and no replacement crypto callbacks are supplied.
+  # Omit the source-provider entry and its OSKext start-once interception.
+  # No POST or missing-provider failure is suppressed.
   EXTRA_MAKE_ARGS+=("prng_random.o_CFLAGS_ADD=-UXNU_SOURCE_CORECRYPTO14")
+  EXTRA_MAKE_ARGS+=("OSKext.cpo_CFLAGS_ADD=-UXNU_SOURCE_CORECRYPTO14")
 else
   EXTRA_MAKE_ARGS+=("prng_random.o_CFLAGS_ADD=")
+  EXTRA_MAKE_ARGS+=("OSKext.cpo_CFLAGS_ADD=")
 fi
 if [ "${XNU_NATIVE_AES:-0}" = 1 ]; then
   if [ "$CRYPTO_BOOTSTRAP_MODE" != prelinked ] || [ "${XNU_SOURCE_CORECRYPTO14:-0}" != 1 ]; then
@@ -659,6 +662,15 @@ if [ "${XNU_SOURCE_CORECRYPTO14:-0}" = 1 ] && [ "$BOOTSTRAP" = 0 ]; then
     test -f "$UFS_ARCHIVE"
     KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$UFS_ARCHIVE"
     KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $UFS_ARCHIVE"
+  fi
+  if [ "${XNU_LIUQIN_SOURCE_STORAGE:-0}" = 1 ]; then
+    # The board's own source IOStorageFamily adapter and UFS block device
+    # (scripts/build-liuqin-source-storage.py). Unlike XNU_NATIVE_UFS this adds
+    # no NativeUfs personality: the runtime creates the service itself.
+    LIUQIN_STORAGE_ARCHIVE=$ROOT/build/liuqin-source-storage/libLiuqinSourceStorage.a
+    test -f "$LIUQIN_STORAGE_ARCHIVE"
+    KERNEL_EXTRA_ARCHIVES="$KERNEL_EXTRA_ARCHIVES -Wl,-force_load,$LIUQIN_STORAGE_ARCHIVE"
+    KERNEL_ARCHIVE_DEPENDENCIES="$KERNEL_ARCHIVE_DEPENDENCIES $LIUQIN_STORAGE_ARCHIVE"
   fi
   if [ "${XNU_NATIVE_ADRENO:-0}" = 1 ]; then
     # NativeAdreno plus its kits (scripts/build-native-adreno-kits.py). No personality is installed: the

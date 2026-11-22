@@ -10,8 +10,10 @@ chip_id, board_id, and the components the steps use.
 import hashlib
 import io
 import json
+import os
 import platform
 import plistlib
+import shutil
 import struct
 import subprocess
 import time
@@ -208,10 +210,12 @@ def decrypt_aea(path):
         if data.get('aea_sha256') == json.loads(path.with_suffix(path.suffix + '.json').read_text()).get('sha256') \
                 and data.get('size') == out.stat().st_size:
             return out
-    if platform.system() != 'Darwin':
-        raise Error(f'{path.name} is AEA encrypted; decrypting it needs macOS /usr/bin/aea')
-    tool('aea', 'macOS /usr/bin/aea decrypts AEA disk images')
-    ipsw = tool('ipsw', 'the ipsw tool fetches the AEA key (brew install blacktop/tap/ipsw)')
+    # The AEA key comes from Apple's public WKMS service; both hosts fetch it
+    # with blacktop's ipsw (IPSW_TOOL overrides the lookup).
+    ipsw = os.environ.get('IPSW_TOOL') or shutil.which('ipsw')
+    if not ipsw:
+        ipsw = tool('ipsw', 'the ipsw tool fetches the AEA key and decrypts on Linux '
+                             '(github.com/blacktop/ipsw; set IPSW_TOOL to its path)')
     log(f'ipsw: fetching the AEA key of {path.name}')
     result = subprocess.run([ipsw, 'fw', 'aea', '--key', str(path)], capture_output=True, text=True)
     keys = [line.strip() for line in result.stdout.splitlines() if line.strip().startswith('base64:')]
@@ -219,15 +223,35 @@ def decrypt_aea(path):
         raise Error(f'could not fetch the AEA key of {path.name}: {result.stderr.strip()[-300:]}')
     partial = out.with_suffix(out.suffix + '.partial')
     log(f'ipsw: decrypting {path.name}')
-    result = subprocess.run(['/usr/bin/aea', 'decrypt', '-i', str(path), '-o', str(partial), '-key-value', keys[0]],
-                            capture_output=True, text=True)
+    if platform.system() == 'Darwin':
+        command = ['/usr/bin/aea', 'decrypt', '-i', str(path), '-o', str(partial), '-key-value', keys[0]]
+    else:
+        # ipsw writes <output dir>/<archive name without .aea>; use a private
+        # directory and rename so a half-written image never passes as the final one.
+        staging = path.with_name(path.name + '.decrypt')
+        staging.mkdir(exist_ok=True)
+        command = [ipsw, 'fw', 'aea', '--key-val', keys[0], '--output', str(staging), str(path)]
+    result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode:
         partial.unlink(missing_ok=True)
         raise Error(f'aea decrypt of {path.name} failed: {result.stderr.strip()[-300:]}')
+    if platform.system() != 'Darwin':
+        made = staging / out.name
+        if not made.is_file():
+            raise Error(f'aea decrypt of {path.name} produced no {out.name}')
+        made.rename(partial)
+        for leftover in staging.iterdir():
+            leftover.unlink()
+        staging.rmdir()
     partial.rename(out)
     source = json.loads(path.with_suffix(path.suffix + '.json').read_text())
     record.write_text(json.dumps({'member': source.get('member'), 'aea_sha256': source.get('sha256'),
                                   'size': out.stat().st_size, 'sha256': sha256_file(out)}, indent=2) + '\n')
+    # The plain image and its record are what disk_image() reuses; the archive
+    # can be re-extracted from the IPSW, so a space-constrained host may drop it.
+    if os.environ.get('UNIXNU_DROP_AEA') == '1':
+        path.unlink(missing_ok=True)
+        log(f'ipsw: dropped {path.name} after decryption (UNIXNU_DROP_AEA=1)')
     return out
 
 
