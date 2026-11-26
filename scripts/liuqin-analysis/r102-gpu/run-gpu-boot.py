@@ -53,6 +53,25 @@ def main() -> None:
     run_dir = EV / f'boot-gpu-{ts}'
     run_dir.mkdir(parents=True)
     OUT.mkdir(parents=True, exist_ok=True)
+    if val.get('usb_debug') is False:
+        if not cli_args.stay_up:
+            raise SystemExit('USB debug is disabled: use --stay-up; returning to fastboot requires the physical buttons')
+        result = subprocess.run(
+            ['fastboot', '-s', common.SERIAL, 'boot', str(boot_img)],
+            capture_output=True, timeout=60,
+        )
+        (run_dir / 'fastboot.log').write_bytes(result.stdout + result.stderr)
+        result.check_returncode()
+        summary = {
+            'status': 'BOOT_COMMAND_ACCEPTED',
+            'boot_img': str(boot_img), 'boot_sha256': val['boot_sha256'],
+            'usb_debug': False, 'desktop_verified': False,
+            'persistent_data_mode': val.get('persistent_data_mode', 'none'),
+        }
+        (run_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+        print('Volatile boot accepted; USB debug is disabled. Desktop and input need on-device verification.')
+        print(run_dir)
+        return
     print(f'Booting volatile {boot_img} (sha256={val["boot_sha256"][:16]}...) -> {run_dir}', flush=True)
 
     proc = subprocess.Popen(

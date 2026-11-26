@@ -113,6 +113,7 @@ extern "C" void native_legacy_vsync_observed(unsigned event,unsigned hz);
 extern "C" uint64_t mach_continuous_time(void);
 extern "C" void flush_dcache64(addr64_t addr,unsigned count,int phys);
 extern "C" vm_offset_t ml_static_ptovirt(vm_offset_t paddr);
+extern "C" unsigned int pmap_cache_attributes(unsigned int pn);
 // 32-bit BGRA, plain ('BGRA') or in Apple's lossless-compressed spelling ('&BGA', one plane): the GPU that renders the surface here writes plain rows
 // either way (no compression is implemented), so the bytes are the same.
 static inline bool nativeBgra(uint32_t format,uint32_t planes) {
@@ -176,13 +177,15 @@ extern "C" OSObject *native_legacy_ioav_color(uint32_t standardType,uint32_t dep
 // IOAVElement: its ID (u64) and score (u32); the byte after the score marks an invalid score (IOAVElement::init clears the ID,
 // copyProperties reads all three, hasValidScore tests the byte, 26C5035r).
 static constexpr unsigned kIOAVElementID=16,kIOAVElementScore=24;
-static constexpr uint64_t kDisplayColorID=100,kDisplayTimingID=1000;
+static constexpr uint64_t kDisplayColorID=100;
+static constexpr uint64_t kDisplayTiming120=1000,kDisplayTiming144=1001,kDisplayTiming60=1002;
 #endif
 class NativeLegacyDisplay;
 static NativeLegacyDisplay *gDirectDisplay=nullptr;
 static NativeLegacyDisplay *gLiveDisplay=nullptr;
 extern "C" {
 volatile uint32_t native_legacy_call_diag[16];
+volatile uint32_t native_legacy_dpu_db[4]; /* [0] flips, [1] latch timeouts, [2] last latch us, [3] (enabled<<16)|pipes */
 void liuqin_fb_suspend(int) __attribute__((weak_import));
 uint32_t native_legacy_hotplug_state(void) {
     if(!gLiveDisplay)return 0xffffffffu;
@@ -311,7 +314,130 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     bool fenceCaptured=false,fenceSlow=false;
     IOTimerEventSource *fenceTimer=nullptr;
     bool directOn=false,directBoot=true;
+    // SM8475 DPU 8.1 hardware VSync double-buffering inside the 43 MiB firmware splash region
+    // (0xb8000000 and 0xb9400000, both inside 0xb8000000..0xbab00000). Members left uninitialized
+    // intentionally (IOKit zero-allocates objects; see validatedAt).
+    IOMemoryMap *dbMdpMap;
+    volatile uint32_t *dbMdp;
+    IOMemoryMap *dbBuf1Map;
+    uintptr_t dbBuf1Va;
+    IOTimerEventSource *dbLatchTimer;
+    const OriginalLegacySwapRequest *dbLatchRequest;
+    uint64_t dbLatchStart;
+    uint32_t dbPipeOff[4];
+    uint32_t dbPipeDelta[4];
+    uint32_t dbPipeCount;
+    uint32_t dbFlushMask;
+    unsigned dbFront;
+    unsigned dbPendingBuf;
+    bool dpuDbOn;
     static constexpr uint32_t kVig[2]={0x4000,0x6000},kCtlFlush=0x15018,kBootIova=0xb8000000U,kBootStride=0x2fa0;
+    void startFenceTimer() {
+        if(fenceTimer)return;
+        IOWorkLoop *loop=getWorkLoop();
+        IOTimerEventSource *t=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::fenceFired):nullptr;
+        if(t && loop->addEventSource(t)==kIOReturnSuccess)fenceTimer=t;
+        else OSSafeReleaseNULL(t);
+    }
+    void startDpuDoubleBuf() {
+        if(directOn || !primary || !bootMapping)return;
+        unsigned enableDb=1;PE_parse_boot_argn("dpu-db",&enableDb,sizeof(enableDb));
+        if(!enableDb)return;
+        PE_Video video={};
+        if(PE_current_console(&video) || bootMapping->getPhysicalAddress()!=kBootIova ||
+           bootMapping->getLength()>0x1400000ULL || !video.v_rowBytes)return;
+        IODeviceMemory *m=IODeviceMemory::withRange(0xae01000ULL,0x30000ULL);
+        IOMemoryMap *mm=m?m->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
+        if(m)m->release();
+        if(!mm)return;
+        volatile uint32_t *reg=reinterpret_cast<volatile uint32_t *>(mm->getVirtualAddress());
+        // SM8450/SM8475 DPU 8.1 SSPP catalog (dpu_8_1_sm8450.h / dpu_hw_ctl.c):
+        static const struct {uint32_t off,bit;} kPipes[8]={
+            {0x4000u,1u<<0},{0x6000u,1u<<1},{0x8000u,1u<<2},{0xa000u,1u<<18},
+            {0x24000u,1u<<11},{0x26000u,1u<<12},{0x28000u,1u<<24},{0x2a000u,1u<<25},
+        };
+        uint32_t found=0,mask=0,firstFmt=0;
+        for(unsigned i=0;i<8;++i) {
+            const uint32_t addr=reg[(kPipes[i].off+0x14u)/4];
+            const uint32_t stride=reg[(kPipes[i].off+0x24u)/4]&0xffffu;
+            if(addr>=kBootIova && addr<0xb9400000u && stride==uint32_t(video.v_rowBytes) && found<4) {
+                dbPipeOff[found]=kPipes[i].off;
+                dbPipeDelta[found]=addr-kBootIova;
+                mask|=kPipes[i].bit;
+                if(!found)firstFmt=reg[(kPipes[i].off+0x30u)/4];
+                ++found;
+            }
+        }
+        const uint32_t ctlTop=reg[0x15014u/4],ctlFl0=reg[kCtlFlush/4];
+        if(!found) {
+            IOLog("LQ102GPU NLD DPU_DB no_pipes ctl_top=0x%x ctl_fl=0x%x\n",ctlTop,ctlFl0);
+            mm->release();return;
+        }
+        // Verify CTL0 latches our SSPP flush mask on a harmless same-address flush before touching Buffer 1.
+        reg[kCtlFlush/4]=mask;
+        __asm__ volatile("dsb sy" ::: "memory");
+        unsigned waitedUs=0;
+        for(;waitedUs<20000 && (reg[kCtlFlush/4]&mask);waitedUs+=100)IODelay(100);
+        if(reg[kCtlFlush/4]&mask) {
+            IOLog("LQ102GPU NLD DPU_DB probe_timeout pipes=%u mask=0x%x fl=0x%x\n",found,mask,reg[kCtlFlush/4]);
+            mm->release();return;
+        }
+        // Measure one full hardware vblank period via a 2nd back-to-back CTL_FLUSH latch right after latch 1.
+        uint64_t tFrame0=mach_absolute_time();
+        reg[kCtlFlush/4]=mask;
+        __asm__ volatile("dsb sy" ::: "memory");
+        unsigned frameWaitUs=0;
+        for(;frameWaitUs<25000 && (reg[kCtlFlush/4]&mask);frameWaitUs+=100)IODelay(100);
+        uint64_t frameNs=0;absolutetime_to_nanoseconds(mach_absolute_time()-tFrame0,&frameNs);
+        uint32_t frameUs=uint32_t(frameNs/1000ull);
+        uint32_t hwHz=(frameUs>=4000 && frameUs<=25000)?((1000000u+frameUs/2u)/frameUs):0u;
+        IODeviceMemory *b1=IODeviceMemory::withRange(0xb9400000ULL,bootMapping->getLength());
+        IOMemoryMap *b1m=b1?b1->map(kIOMapAnywhere|kIOMapWriteCombineCache):nullptr;
+        if(b1)b1->release();
+        IOWorkLoop *loop=getWorkLoop();
+        IOTimerEventSource *lt=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::dbLatchFired):nullptr;
+        if(!b1m || !lt || loop->addEventSource(lt)!=kIOReturnSuccess) {
+            OSSafeReleaseNULL(b1m);OSSafeReleaseNULL(lt);mm->release();return;
+        }
+        dbMdpMap=mm;dbMdp=reg;dbBuf1Map=b1m;dbBuf1Va=static_cast<uintptr_t>(b1m->getVirtualAddress());
+        dbLatchTimer=lt;dbPipeCount=found;dbFlushMask=mask;dbFront=0;dbPendingBuf=0;dpuDbOn=true;
+        native_legacy_dpu_db[3]=(1u<<16)|found;
+        IOLog("LQ102GPU NLD DPU_DB ready pipes=%u mask=0x%x fmt=0x%x ctl_top=0x%x probe_us=%u frame_us=%u hw_hz=%u\n",
+              found,mask,firstFmt,ctlTop,waitedUs,frameUs,hwHz);
+    }
+    void dbFlip(unsigned bufIdx) {
+        const uint32_t base=bufIdx?0xb9400000u:kBootIova;
+        for(uint32_t i=0;i<dbPipeCount;++i)dbMdp[(dbPipeOff[i]+0x14u)/4]=base+dbPipeDelta[i];
+        __asm__ volatile("dsb sy" ::: "memory");
+        dbMdp[kCtlFlush/4]=dbFlushMask;
+        __asm__ volatile("dsb sy" ::: "memory");
+    }
+    void dbResetToBuf0() {
+        if(!dpuDbOn)return;
+        if(dbLatchTimer)dbLatchTimer->cancelTimeout();
+        dbLatchRequest=nullptr;
+        if(dbFront!=0){dbFlip(0);dbFront=0;}
+    }
+    static void dbLatchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->dbLatchTick();}
+    void dbLatchTick() {
+        if(!dbLatchRequest)return;
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-dbLatchStart,&ns);
+        const bool pending=(dbMdp[kCtlFlush/4]&dbFlushMask)!=0;
+        if(pending && ns<25000000ull){dbLatchTimer->setTimeoutUS(500);return;}
+        const OriginalLegacySwapRequest *request=dbLatchRequest;dbLatchRequest=nullptr;
+        if(pending) {
+            native_legacy_dpu_db[1]=native_legacy_dpu_db[1]+1;
+            if(native_legacy_dpu_db[0]==0) {
+                dbFlip(0);dbFront=0;dpuDbOn=false;native_legacy_dpu_db[3]=dbPipeCount;
+                IOLog("LQ102GPU NLD DPU_DB disabled after first flip timeout\n");
+            }
+        } else {
+            dbFront=dbPendingBuf;
+            native_legacy_dpu_db[0]=native_legacy_dpu_db[0]+1;
+            native_legacy_dpu_db[2]=uint32_t(ns/1000);
+        }
+        finishTransfer(request);
+    }
     void startDirect() {
         unsigned mode=0;PE_parse_boot_argn("dpu-scanout",&mode,sizeof(mode));
         if(mode<2 || !&native_ufs_dpu_map || !&native_ufs_dpu_state || !(native_ufs_dpu_state>>31) || !primary)return;
@@ -321,9 +447,9 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         directPages=static_cast<uint64_t *>(IOMallocData(8192*sizeof(uint64_t)));
         IOWorkLoop *loop=getWorkLoop();
         latchTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::latchFired):nullptr;
-        fenceTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::fenceFired):nullptr;
-        if(!mdpMap || !directPages || !latchTimer || !fenceTimer || loop->addEventSource(fenceTimer)!=kIOReturnSuccess || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
-            OSSafeReleaseNULL(mdpMap);OSSafeReleaseNULL(latchTimer);OSSafeReleaseNULL(fenceTimer);
+        startFenceTimer();
+        if(!mdpMap || !directPages || !latchTimer || !fenceTimer || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
+            OSSafeReleaseNULL(mdpMap);OSSafeReleaseNULL(latchTimer);
             if(directPages){IOFreeData(directPages,8192*sizeof(uint64_t));directPages=nullptr;}
             return;
         }
@@ -389,12 +515,16 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             fenceFor=request;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;
         }
         uint32_t submitted=0,retired=0,detail[3]={0,0,4};
-        // Preserve the CPU-only backend when no GPU fence interface is linked.
-        if(!&native_adreno_fences_detail && !&native_adreno_fences) {
+        // Preserve the CPU-only backend when no GPU fence interface is linked or fence timer is absent.
+        if(!fenceTimer || (!&native_adreno_fences_detail && !&native_adreno_fences)) {
             gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),0,0,0,0,0,0,0,4);return true;
         }
         const bool known=&native_adreno_fences_detail?native_adreno_fences_detail(&submitted,&retired,detail):
             (&native_adreno_fences && native_adreno_fences(&submitted,&retired));
+        // Before the GPU service is published (detail[2]==0), no GPU rendering exists yet: do not stall early frames.
+        if(!known && &native_adreno_fences_detail && detail[2]==0) {
+            fenceFor=nullptr;return true;
+        }
         if(known && !fenceCaptured) {
             fenceTarget=submitted;fenceCaptured=true;
         }
@@ -417,6 +547,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
             gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),2,fenceTarget,submitted,retired,ns,detail[0],detail[1],detail[2]);
             native_legacy_direct[12]=native_legacy_direct[12]+1;
             fenceSlow=true;
+        }
+        // If the GPU ring is poisoned (detail[2]==3) and 250 ms elapsed, fall through so the display does not freeze permanently.
+        if(!known && detail[2]==3 && ns>=250000000ull) {
+            fenceFor=nullptr;return true;
         }
         gpuTraceEvent(GpuTraceDisplayFence,0,traceId(request),known?3:4,fenceTarget,submitted,retired,ns,detail[0],detail[1],detail[2]);
         fenceTimer->setTimeoutUS(200);
@@ -468,7 +602,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         vsyncArmed=true;vsyncTimer->wakeAtTime(vsyncNext);
     }
     void startVsync() {
-        unsigned hz=native_legacy_refresh_hz();
+        unsigned hz=effectiveRefreshHz();
         if(!hz || hz>240 || !primary || !bootMapping || vsyncTimer)return;
         IOWorkLoop *loop=getWorkLoop();
         if(!loop)return;
@@ -520,6 +654,9 @@ public:
         stopVsync();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
         directToBoot();latchRequest=nullptr;pendingSlot=-1;
+        dbResetToBuf0();
+        if(dbLatchTimer){dbLatchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(dbLatchTimer);OSSafeReleaseNULL(dbLatchTimer);}
+        dpuDbOn=false;dbMdp=nullptr;dbBuf1Va=0;OSSafeReleaseNULL(dbBuf1Map);OSSafeReleaseNULL(dbMdpMap);
         if(fenceTimer){fenceTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(fenceTimer);OSSafeReleaseNULL(fenceTimer);}
         if(latchTimer){latchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
         directOn=false;
@@ -540,7 +677,7 @@ public:
     bool start(IOService *provider) override {
         if(!startDisplay(provider))return false;
         publishOneLayer();
-        startVsync();startDirect();return true;
+        startVsync();startFenceTimer();startDirect();startDpuDoubleBuf();return true;
     }
     // CoreAnimation reads how many layers the display scans out from IOMFBNumLayers (MaxNumLayers). Without the property it may hand a
     // full-screen layer (an app's Metal layer) to the display as a detached layer of its own, copied through the IOSurfaceAccelerator
@@ -603,7 +740,7 @@ public:
         if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
         // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does), and without it the render server keeps its own
         // 1/60 s heartbeat (int-210: refresh=0). Publish it before any client can find the display, only when vsync asks for more.
-        unsigned hz=native_legacy_refresh_hz();
+        unsigned hz=effectiveRefreshHz();
         if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
@@ -613,10 +750,16 @@ public:
     // own rate instead; the maximum interval and the step keep the original values. Words in 32.32 seconds, then their mach times.
     // The original maximum interval is 1/24 s (int-240), which offers the render server a 24 to vsync Hz range. The panel has no
     // variable refresh, so vsync-fixed=1 reports the maximum interval equal to the minimum: one fixed rate.
+    unsigned activeRefreshHz=0;
+    unsigned effectiveRefreshHz() const {
+        if(activeRefreshHz>=60 && activeRefreshHz<=240)return activeRefreshHz;
+        unsigned hz=native_legacy_refresh_hz();
+        return (hz>=60 && hz<=240)?hz:120u;
+    }
     bool getRefreshAttributes(uint64_t *words,bool fixed) override {
         const uint32_t n=bumpCall(9);
         if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
-        unsigned hz=native_legacy_refresh_hz();
+        unsigned hz=effectiveRefreshHz();
         if(n<=4)IOLog("LQ102GPU NLD getRefreshAttributes(fixed=%u) hz=%u w0=0x%llx w2=0x%llx\n",(unsigned)fixed,hz,(unsigned long long)words[0],(unsigned long long)words[2]);
         if(hz<=60 || hz>240)return true;
         unsigned locked=0;PE_parse_boot_argn("vsync-fixed",&locked,sizeof(locked));
@@ -674,6 +817,7 @@ public:
             }
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
             directToBoot();
+            dbResetToBuf0();
             if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),blank.v_rowBytes,(uint32_t)blank.v_width,(uint32_t)blank.v_height,0xff000000U)) {
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
@@ -758,6 +902,10 @@ public:
             }
             return;
         }
+        // Wait for every GPU command buffer scheduled before this swap to retire before the CPU
+        // invalidates cache and reads the IOSurface: WindowServer submits swaps at schedule time,
+        // so copying earlier captures half-rendered sysmem frames (flashing/disappearing UI parts).
+        if(!gpuWrote(request)) {transferred=true;return;}
         // Zero-trap direct physical-segment BGRA copy via permanent 1:1 kernel linear map (ml_static_ptovirt):
         // avoids creating/tearing down a 20 MiB lazy kernel_map view and taking 5,130 L3 page faults per frame on 4 KiB XNU.
         if(!half) {
@@ -768,7 +916,10 @@ public:
                 native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
             }
             uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
-            const uintptr_t dstBase=static_cast<uintptr_t>(bootMapping->getVirtualAddress());
+            const bool useDb=(dpuDbOn && rotated);
+            const unsigned nextBuf=useDb?(1u-dbFront):0u;
+            const uintptr_t dstBase=useDb?(nextBuf?dbBuf1Va:static_cast<uintptr_t>(bootMapping->getVirtualAddress()))
+                :static_cast<uintptr_t>(bootMapping->getVirtualAddress());
             const uint64_t dstStride=video.v_rowBytes;
             const uint64_t rowBytes=uint64_t(width)*4;
             const uint64_t totalNeed=sourceStride*(height-1)+rowBytes;
@@ -810,40 +961,133 @@ public:
                     off+=useLen;
                 }
                 if(ok) {
-                    auto read8=[&](uint64_t byteOff,uint32_t out[8]){
-                        const uint64_t pg=byteOff>>12;
-                        const uint64_t inP=byteOff&4095ULL;
-                        if(inP<=4064ULL) {
-                            memcpy(out,sPageVa[pg]+inP,32);
-                        } else {
-                            const uint64_t a=4096ULL-inP;
-                            memcpy(out,sPageVa[pg]+inP,size_t(a));
-                            memcpy(reinterpret_cast<uint8_t *>(out)+a,sPageVa[pg+1],size_t(32ULL-a));
-                        }
-                    };
-                    for(uint32_t lx0=0;lx0<width;lx0+=8) {
-                        for(uint32_t ly0=0;ly0<height;ly0+=8) {
-                            uint32_t tile[8][8];
-                            for(uint32_t r=0;r<8;++r)
-                                read8(uint64_t(ly0+r)*sourceStride+uint64_t(lx0)*4,tile[r]);
-                            if(doSample && (ly0&63)==32 && (lx0&63)==0) {
-                                const uint32_t px=tile[0][0];
-                                ++sTotal;
-                                if((px&0x00ffffffu)!=0)++sLit;
-                                unsigned ci=0;while(ci<sUsed && sCols[ci]!=px)++ci;
-                                if(ci<sUsed)++sColCnt[ci];
-                                else if(sUsed<4){sCols[sUsed]=px;sColCnt[sUsed]=1;++sUsed;}
+                    uint64_t rotStart=0;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(rotStart));
+                    constexpr uint64_t kOpaqueAlpha=0xff000000ff000000ULL;
+                    constexpr uint64_t kLo32=0x00000000ffffffffULL;
+                    constexpr uint64_t kHi32=0xffffffff00000000ULL;
+                    if((sourceStride&31ULL)==0) {
+                        // Fast register-tiled 90-degree CCW transpose:
+                        // ly0 outer in 16-row strips (64-byte full WC cache-line bursts per dst row) + 8-row tail;
+                        // lx0 inner in 8-pixel (32-byte) sequential chunks (never crosses a 4 KiB page boundary).
+                        uint32_t ly0=0;
+                        for(;ly0+16<=height;ly0+=16) {
+                            uint64_t rb[16];
+                            for(uint32_t r=0;r<16;++r)rb[r]=uint64_t(ly0+r)*sourceStride;
+                            const uint64_t dstColOff=uint64_t(physW-16-ly0)*4;
+                            for(uint32_t lx0=0;lx0<width;lx0+=8) {
+                                const uint64_t lxBytes=uint64_t(lx0)*4;
+                                const uint64_t *p[16];
+                                for(uint32_t r=0;r<16;++r) {
+                                    const uint64_t bo=rb[r]+lxBytes;
+                                    p[r]=reinterpret_cast<const uint64_t *>(sPageVa[bo>>12]+(bo&4095ULL));
+                                }
+                                if(doSample && (ly0&63)==32 && (lx0&63)==0) {
+                                    const uint32_t px=uint32_t(p[0][0]);
+                                    ++sTotal;
+                                    if((px&0x00ffffffu)!=0)++sLit;
+                                    unsigned ci=0;while(ci<sUsed && sCols[ci]!=px)++ci;
+                                    if(ci<sUsed)++sColCnt[ci];
+                                    else if(sUsed<4){sCols[sUsed]=px;sColCnt[sUsed]=1;++sUsed;}
+                                }
+                                uintptr_t dRow=dstBase+uint64_t(lx0)*dstStride+dstColOff;
+                                for(uint32_t k=0;k<4;++k,dRow+=dstStride*2) {
+                                    uint64_t *o0=reinterpret_cast<uint64_t *>(dRow);
+                                    uint64_t *o1=reinterpret_cast<uint64_t *>(dRow+dstStride);
+                                    const uint64_t r15=p[15][k],r14=p[14][k],r13=p[13][k],r12=p[12][k];
+                                    const uint64_t r11=p[11][k],r10=p[10][k],r9=p[9][k],r8=p[8][k];
+                                    o0[0]=((r15&kLo32)|(r14<<32))|kOpaqueAlpha;
+                                    o0[1]=((r13&kLo32)|(r12<<32))|kOpaqueAlpha;
+                                    o0[2]=((r11&kLo32)|(r10<<32))|kOpaqueAlpha;
+                                    o0[3]=((r9&kLo32)|(r8<<32))|kOpaqueAlpha;
+                                    o1[0]=((r15>>32)|(r14&kHi32))|kOpaqueAlpha;
+                                    o1[1]=((r13>>32)|(r12&kHi32))|kOpaqueAlpha;
+                                    o1[2]=((r11>>32)|(r10&kHi32))|kOpaqueAlpha;
+                                    o1[3]=((r9>>32)|(r8&kHi32))|kOpaqueAlpha;
+                                    const uint64_t r7=p[7][k],r6=p[6][k],r5=p[5][k],r4=p[4][k];
+                                    const uint64_t r3=p[3][k],r2=p[2][k],r1=p[1][k],r0=p[0][k];
+                                    o0[4]=((r7&kLo32)|(r6<<32))|kOpaqueAlpha;
+                                    o0[5]=((r5&kLo32)|(r4<<32))|kOpaqueAlpha;
+                                    o0[6]=((r3&kLo32)|(r2<<32))|kOpaqueAlpha;
+                                    o0[7]=((r1&kLo32)|(r0<<32))|kOpaqueAlpha;
+                                    o1[4]=((r7>>32)|(r6&kHi32))|kOpaqueAlpha;
+                                    o1[5]=((r5>>32)|(r4&kHi32))|kOpaqueAlpha;
+                                    o1[6]=((r3>>32)|(r2&kHi32))|kOpaqueAlpha;
+                                    o1[7]=((r1>>32)|(r0&kHi32))|kOpaqueAlpha;
+                                }
                             }
+                        }
+                        for(;ly0<height;ly0+=8) {
+                            uint64_t rb[8];
+                            for(uint32_t r=0;r<8;++r)rb[r]=uint64_t(ly0+r)*sourceStride;
                             const uint64_t dstColOff=uint64_t(physW-8-ly0)*4;
-                            for(uint32_t c=0;c<8;++c) {
-                                volatile uint64_t *o64=reinterpret_cast<volatile uint64_t *>(
-                                    dstBase+uint64_t(lx0+c)*dstStride+dstColOff);
-                                o64[0]=uint64_t(tile[7][c])|(uint64_t(tile[6][c])<<32);
-                                o64[1]=uint64_t(tile[5][c])|(uint64_t(tile[4][c])<<32);
-                                o64[2]=uint64_t(tile[3][c])|(uint64_t(tile[2][c])<<32);
-                                o64[3]=uint64_t(tile[1][c])|(uint64_t(tile[0][c])<<32);
+                            for(uint32_t lx0=0;lx0<width;lx0+=8) {
+                                const uint64_t lxBytes=uint64_t(lx0)*4;
+                                const uint64_t *p[8];
+                                for(uint32_t r=0;r<8;++r) {
+                                    const uint64_t bo=rb[r]+lxBytes;
+                                    p[r]=reinterpret_cast<const uint64_t *>(sPageVa[bo>>12]+(bo&4095ULL));
+                                }
+                                uintptr_t dRow=dstBase+uint64_t(lx0)*dstStride+dstColOff;
+                                for(uint32_t k=0;k<4;++k,dRow+=dstStride*2) {
+                                    uint64_t *o0=reinterpret_cast<uint64_t *>(dRow);
+                                    uint64_t *o1=reinterpret_cast<uint64_t *>(dRow+dstStride);
+                                    const uint64_t r7=p[7][k],r6=p[6][k],r5=p[5][k],r4=p[4][k];
+                                    const uint64_t r3=p[3][k],r2=p[2][k],r1=p[1][k],r0=p[0][k];
+                                    o0[0]=((r7&kLo32)|(r6<<32))|kOpaqueAlpha;
+                                    o0[1]=((r5&kLo32)|(r4<<32))|kOpaqueAlpha;
+                                    o0[2]=((r3&kLo32)|(r2<<32))|kOpaqueAlpha;
+                                    o0[3]=((r1&kLo32)|(r0<<32))|kOpaqueAlpha;
+                                    o1[0]=((r7>>32)|(r6&kHi32))|kOpaqueAlpha;
+                                    o1[1]=((r5>>32)|(r4&kHi32))|kOpaqueAlpha;
+                                    o1[2]=((r3>>32)|(r2&kHi32))|kOpaqueAlpha;
+                                    o1[3]=((r1>>32)|(r0&kHi32))|kOpaqueAlpha;
+                                }
                             }
                         }
+                    } else {
+                        auto read8=[&](uint64_t byteOff,uint32_t out[8]){
+                            const uint64_t pg=byteOff>>12;
+                            const uint64_t inP=byteOff&4095ULL;
+                            if(inP<=4064ULL) {
+                                memcpy(out,sPageVa[pg]+inP,32);
+                            } else {
+                                const uint64_t a=4096ULL-inP;
+                                memcpy(out,sPageVa[pg]+inP,size_t(a));
+                                memcpy(reinterpret_cast<uint8_t *>(out)+a,sPageVa[pg+1],size_t(32ULL-a));
+                            }
+                        };
+                        for(uint32_t lx0=0;lx0<width;lx0+=8) {
+                            for(uint32_t ly0=0;ly0<height;ly0+=8) {
+                                uint32_t tile[8][8];
+                                for(uint32_t r=0;r<8;++r)
+                                    read8(uint64_t(ly0+r)*sourceStride+uint64_t(lx0)*4,tile[r]);
+                                if(doSample && (ly0&63)==32 && (lx0&63)==0) {
+                                    const uint32_t px=tile[0][0];
+                                    ++sTotal;
+                                    if((px&0x00ffffffu)!=0)++sLit;
+                                    unsigned ci=0;while(ci<sUsed && sCols[ci]!=px)++ci;
+                                    if(ci<sUsed)++sColCnt[ci];
+                                    else if(sUsed<4){sCols[sUsed]=px;sColCnt[sUsed]=1;++sUsed;}
+                                }
+                                const uint64_t dstColOff=uint64_t(physW-8-ly0)*4;
+                                for(uint32_t c=0;c<8;++c) {
+                                    volatile uint64_t *o64=reinterpret_cast<volatile uint64_t *>(
+                                        dstBase+uint64_t(lx0+c)*dstStride+dstColOff);
+                                    o64[0]=(uint64_t(tile[7][c])|(uint64_t(tile[6][c])<<32))|kOpaqueAlpha;
+                                    o64[1]=(uint64_t(tile[5][c])|(uint64_t(tile[4][c])<<32))|kOpaqueAlpha;
+                                    o64[2]=(uint64_t(tile[3][c])|(uint64_t(tile[2][c])<<32))|kOpaqueAlpha;
+                                    o64[3]=(uint64_t(tile[1][c])|(uint64_t(tile[0][c])<<32))|kOpaqueAlpha;
+                                }
+                            }
+                        }
+                    }
+                    if(doSample) {
+                        uint64_t rotEnd=0,frq=19200000;
+                        __asm__ volatile("isb\n\tmrs %0, cntpct_el0\n\tmrs %1, cntfrq_el0":"=r"(rotEnd),"=r"(frq));
+                        if(!frq)frq=19200000;
+                        IOLog("LQ102GPU COPY_SPLIT #%u flush_us=%llu rot_us=%llu stride=%llu\n",
+                              fno,(unsigned long long)((rotStart-copyStart)*1000000ULL/frq),
+                              (unsigned long long)((rotEnd-rotStart)*1000000ULL/frq),(unsigned long long)sourceStride);
                     }
                 }
             } else {
@@ -918,9 +1162,16 @@ public:
             }
             shadowValid=false;transferred=true;
             native_legacy_transfer_observed(kIOReturnSuccess,request,length);
+            if(useDb) {
+                dbPendingBuf=nextBuf;dbLatchRequest=request;dbLatchStart=mach_absolute_time();
+                dbFlip(nextBuf);
+                dbLatchTimer->setTimeoutUS(500);
+                return;
+            }
             finishTransfer(request);
             return;
         }
+        dbResetToBuf0();
         // Surfaces may be write-combined (iPadOS 27 display surfaces are): reading them uncached costs seconds per frame. Read through
         // a cacheable view, after cleaning and invalidating it so lines from the previous frame are not reused.
         IOMemoryMap *source=memory->map(kIOMapAnywhere|kIOMapReadOnly|kIOMapCopybackCache);
@@ -1035,6 +1286,8 @@ public:
         if(n<=8)IOLog("LQ102GPU NLD cancelSwapsAfterTimeout #%u\n",n);
         native_legacy_swap_timeouts=native_legacy_swap_timeouts+1;
         if(fenceTimer)fenceTimer->cancelTimeout();
+        if(dbLatchTimer)dbLatchTimer->cancelTimeout();
+        dbLatchRequest=nullptr;
         fenceFor=nullptr;fenceTarget=0;fenceSince=0;fenceCaptured=false;fenceSlow=false;traceGpuComplete=false;
         for(auto &entry: validated)entry=nullptr;
         gpuRequest=nullptr;gpuRetired=false;transferred=false;
@@ -1224,7 +1477,10 @@ public:
            !video.v_width || !video.v_height || video.v_depth!=32 || video.v_rotate ||
            video.v_width>16384 || video.v_height>16384 || video.v_rowBytes<video.v_width*4 ||
            video.v_rowBytes>UINT64_MAX/video.v_height)return false;
-        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
+        // Scanout lives in reserved splash DRAM (0xb8000000); Normal Non-Cacheable write-combining
+        // avoids 22-93 ms Device-nGnRnE per-store stalls while keeping writes immediately visible to DPU.
+        IOMemoryMap *mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapWriteCombineCache);
+        if(!mapping)mapping=provider->mapDeviceMemoryWithIndex(0,kIOMapInhibitCache);
         if(!mapping)return false;
         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                    mapping->getLength()==video.v_rowBytes*video.v_height;
@@ -1252,9 +1508,10 @@ public:
                 if(valid){
                     gLiveDisplay=this;
                     native_legacy_hotplug_notify(this,1);
-                    IOLog("LQ102GPU NLD startHardware ok %ux%u primary=%u vdisp=%lu hp=%u vsync=%u\n",
+                    IOLog("LQ102GPU NLD startHardware ok %ux%u primary=%u vdisp=%lu hp=%u vsync=%u pmap=0x%x\n",
                           width,height,(unsigned)primary,(unsigned long)video.v_display,
-                          native_legacy_hotplug_state(),native_legacy_refresh_hz());
+                          native_legacy_hotplug_state(),native_legacy_refresh_hz(),
+                          pmap_cache_attributes(unsigned(bootMapping->getPhysicalAddress()>>12)));
                 }
 #endif
             }
@@ -1283,29 +1540,47 @@ public:
     // has no timing generator), and the pixel clock from it. The color element is 8-bit RGB SDR with sRGB chromaticities. The
     // physical size comes only from the provider's dot pitch; without one it is left out, as no panel size is known here.
     bool publishDisplayAttributes(uint32_t width,uint32_t height) {
-        unsigned hz=60;PE_parse_boot_argn("vsync",&hz,sizeof(hz));if(!hz || hz>240)hz=60;
-        uint8_t timingData[80]={};
+        unsigned prefHz=effectiveRefreshHz();
+        static const struct {uint64_t id; unsigned hz;} kModes[3]={
+            {kDisplayTiming120,120u}, {kDisplayTiming144,144u}, {kDisplayTiming60,60u},
+        };
         uint32_t hTotal=width+160,vTotal=height+23;
-        auto word=[&](unsigned offset,uint32_t value){memcpy(timingData+offset,&value,4);};
-        word(4,hTotal);word(8,width);word(12,32);word(16,80);word(20,48);word(28,1);
-        word(36,vTotal);word(40,height);word(44,6);word(48,14);word(52,3);word(56,hz<<16);
-        word(68,(uint32_t)((uint64_t)hTotal*vTotal*hz));
-        OSObject *timing=native_legacy_ioav_timing(timingData,2,4);
+        auto makeTiming=[&](unsigned hz,uint64_t id,uint32_t score)->OSObject *{
+            uint8_t timingData[80]={};
+            auto word=[&](unsigned offset,uint32_t value){memcpy(timingData+offset,&value,4);};
+            word(4,hTotal);word(8,width);word(12,32);word(16,80);word(20,48);word(28,1);
+            word(36,vTotal);word(40,height);word(44,6);word(48,14);word(52,3);word(56,hz<<16);
+            word(68,(uint32_t)((uint64_t)hTotal*vTotal*hz));
+            OSObject *t=native_legacy_ioav_timing(timingData,2,4);
+            if(t) {
+                auto base=reinterpret_cast<uint8_t *>(t);
+                memcpy(base+kIOAVElementID,&id,8);memcpy(base+kIOAVElementScore,&score,4);
+            }
+            return t;
+        };
         OSObject *color=native_legacy_ioav_color(2,8,0,0,0,16,false,nullptr,nullptr,nullptr,nullptr);
         OSDictionary *attributes=OSDictionary::withCapacity(16),*product=OSDictionary::withCapacity(8),*chromaticity=OSDictionary::withCapacity(3);
         OSDictionary *white=point(20493,21561),*transport=OSDictionary::withCapacity(2),*source=OSDictionary::withCapacity(8),*scaling=OSDictionary::withCapacity(2);
-        OSArray *colors=OSArray::withCapacity(1),*timings=OSArray::withCapacity(1),*timingColors=OSArray::withCapacity(1);
+        OSArray *colors=OSArray::withCapacity(1),*timings=OSArray::withCapacity(3),*timingColors=OSArray::withCapacity(1);
+        OSObject *timingObjs[3]={nullptr,nullptr,nullptr};
         bool done=false;
         do {
-            if(!timing || !color || !attributes || !product || !chromaticity || !white || !transport || !source || !scaling ||
+            if(!color || !attributes || !product || !chromaticity || !white || !transport || !source || !scaling ||
                !colors || !timings || !timingColors)break;
-            auto ident=[](OSObject *element,uint64_t id){
-                auto base=reinterpret_cast<uint8_t *>(element);uint32_t score=(uint32_t)id;
-                memcpy(base+kIOAVElementID,&id,8);memcpy(base+kIOAVElementScore,&score,4);
-            };
-            ident(color,kDisplayColorID);ident(timing,kDisplayTimingID);
-            if(!colors->setObject(color) || !timingColors->setObject(color) || !timings->setObject(timing))break;
-            native_legacy_ioav_timing_colors(timing,timingColors);
+            {
+                auto base=reinterpret_cast<uint8_t *>(color);
+                uint64_t cid=kDisplayColorID;uint32_t cscore=(uint32_t)cid;
+                memcpy(base+kIOAVElementID,&cid,8);memcpy(base+kIOAVElementScore,&cscore,4);
+            }
+            if(!colors->setObject(color) || !timingColors->setObject(color))break;
+            bool modesOk=true;
+            for(unsigned i=0;i<3;++i) {
+                const uint32_t score=(kModes[i].hz==prefHz)?2000u:(kModes[i].hz==144u?1500u:1000u);
+                timingObjs[i]=makeTiming(kModes[i].hz,kModes[i].id,score);
+                if(!timingObjs[i] || !timings->setObject(timingObjs[i])){modesOk=false;break;}
+                native_legacy_ioav_timing_colors(timingObjs[i],timingColors);
+            }
+            if(!modesOk)break;
             if(!putString(product,"ManufacturerID","UNX") || !putNumber(product,"ProductID",0) || !putNumber(product,"SerialNumber",0) ||
                !putString(product,"ProductName","UniXNU Display"))break;
             if(!putPoint(chromaticity,"Red",41943,21627) || !putPoint(chromaticity,"Green",19661,39322) ||
@@ -1334,7 +1609,8 @@ public:
         } while(false);
         OSSafeReleaseNULL(attributes);OSSafeReleaseNULL(product);OSSafeReleaseNULL(chromaticity);OSSafeReleaseNULL(white);
         OSSafeReleaseNULL(transport);OSSafeReleaseNULL(source);OSSafeReleaseNULL(scaling);OSSafeReleaseNULL(colors);
-        OSSafeReleaseNULL(timings);OSSafeReleaseNULL(timingColors);OSSafeReleaseNULL(color);OSSafeReleaseNULL(timing);
+        OSSafeReleaseNULL(timings);OSSafeReleaseNULL(timingColors);OSSafeReleaseNULL(color);
+        for(unsigned i=0;i<3;++i)OSSafeReleaseNULL(timingObjs[i]);
         return done;
     }
     // The display's container identifier, as macOS ties a touch screen to its display: WindowServer (WSHIDDisplayEventListener) takes
@@ -1381,7 +1657,7 @@ public:
         memcpy(edid+25,srgb,10);
         for(unsigned i=38;i<54;++i)edid[i]=0x01;   // no standard timings
         // Detailed timing: the derived reduced-blanking timing of publishDisplayAttributes (blanking 160 x 23, sync 32 x 6, front 48 x 3).
-        unsigned hz=60;PE_parse_boot_argn("vsync",&hz,sizeof(hz));if(!hz || hz>240)hz=60;
+        unsigned hz=effectiveRefreshHz();
         const uint32_t hBlank=160,vBlank=23,hFront=48,hSync=32,vFront=3,vSync=6;
         uint64_t clock=(uint64_t)(width+hBlank)*(height+vBlank)*hz/10000;if(clock>0xffff)clock=0xffff;
         uint8_t *d=edid+54;
@@ -1454,9 +1730,17 @@ public:
     uint32_t colorRemapMode=6;   // what the family's get_color_remap_mode answers before any change
     IOReturn setDigitalOutMode(uint32_t colorID,uint32_t timingID) override {
         const uint32_t n=bumpCall(1);
-        IOReturn st=(colorID!=kDisplayColorID || timingID!=kDisplayTimingID)?kIOReturnBadArgument:kIOReturnSuccess;
-        if(n<=8)IOLog("LQ102GPU NLD setDigitalOutMode(color=%u, timing=%u) -> 0x%x\n",colorID,timingID,(unsigned)st);
+        unsigned newHz=0;
+        if(timingID==kDisplayTiming120)newHz=120u;
+        else if(timingID==kDisplayTiming144)newHz=144u;
+        else if(timingID==kDisplayTiming60)newHz=60u;
+        IOReturn st=(colorID!=kDisplayColorID || !newHz)?kIOReturnBadArgument:kIOReturnSuccess;
+        if(n<=16)IOLog("LQ102GPU NLD setDigitalOutMode(color=%u, timing=%u, hz=%u) -> 0x%x\n",colorID,timingID,newHz,(unsigned)st);
         if(st!=kIOReturnSuccess)return st;
+        activeRefreshHz=newHz;
+        vsyncHz=newHz;
+        nanoseconds_to_absolutetime(1000000000ull/newHz,&vsyncInterval);
+        (void)native_legacy_set_refresh_properties(this);
         uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
         setProperty("DisplayWidth",width,32);setProperty("DisplayHeight",height,32);setProperty("DPTimingModeId",timingID,32);
         return kIOReturnSuccess;

@@ -43,8 +43,8 @@ def load_mod(name: str, p: Path):
     return mod
 
 
-def adt_add_gpu_addon(raw: bytes, add_gpu_addon: bool = True) -> bytes:
-    """Patch ADT for SM8475 DRAM range, sRGB LCD display profile, and /chosen/memory-map/GpuAddon."""
+def adt_add_gpu_addon(raw: bytes, add_gpu_addon: bool = True, add_bluetooth: bool = False) -> bytes:
+    """Patch ADT for SM8475 DRAM range, sRGB LCD display profile, /chosen/memory-map/GpuAddon, and /arm-io/bluetooth."""
 
     def parse_node(buf: bytes, off: int):
         nprops, nchildren = struct.unpack_from('<II', buf, off)
@@ -106,6 +106,26 @@ def adt_add_gpu_addon(raw: bytes, add_gpu_addon: bool = True) -> bytes:
             'oled-display': struct.pack('<I', 0),
         }
         product['props'] = [(k, overrides.get(k, v)) for k, v in product['props']]
+    if add_bluetooth:
+        arm_io = next((c for c in root['children'] if node_name(c) == 'arm-io'), None)
+        if arm_io is not None and not any(node_name(c) == 'bluetooth' for c in arm_io['children']):
+            arm_io['children'].append({
+                'props': [
+                    ('name', b'bluetooth\x00'),
+                    ('device_type', b'bluetooth\x00'),
+                    ('transport-encoding', struct.pack('<I', 1)),
+                    ('transport-speed', struct.pack('<I', 3200000)),
+                ],
+                'children': [],
+            })
+        if arm_io is not None and not any(node_name(c) == 'wlan' for c in arm_io['children']):
+            arm_io['children'].append({
+                'props': [
+                    ('name', b'wlan\x00'),
+                    ('device_type', b'wlan\x00'),
+                ],
+                'children': [],
+            })
     return encode_node(root)
 
 
@@ -114,6 +134,13 @@ def main() -> None:
     ap.add_argument('--gpu-addon', type=Path, help='NGPUADD2 kernel.macho.gpuaddon file to stage into payload')
     ap.add_argument('--trust-json', type=Path, help='trust.json containing cdhash and turnip_cdhash to append to trustcache')
     ap.add_argument('--repack-only', action='store_true', help='Skip XNU compile/prelink and repack existing kernel.macho with updated addon/trustcache')
+    ap.add_argument('--with-input', action='store_true', help='Build the Liuqin cover and NT36532 input port')
+    ap.add_argument('--with-wireless', action='store_true', help='Build Liuqin WCN6855 power + Bluetooth (QcaBluetooth) port')
+    ap.add_argument('--build-only', action='store_true', help='Build the existing isolated device without regenerating its sources')
+    ap.add_argument('--no-usb-debug', dest='usb_debug', action='store_false', default=True,
+                    help='Disable the USB debug gadget and console mirror (enabled by default)')
+    ap.add_argument('--persistent-data', choices=('none', 'reuse', 'init', 'format'), default='none',
+                    help='Use free userdata for UFS Data; init needs blank metadata, format permits replacing old non-Data content')
     cli_args = ap.parse_args()
 
     WORK.mkdir(parents=True, exist_ok=True)
@@ -129,12 +156,12 @@ def main() -> None:
         segments, sections = layout.parse_macho_segments(ev / 'standalone.macho')
         gate_j = json.loads((ev / 'aes-fileset-gate.json').read_text())
         assert gate_j['status'] == 'PASS'
-    else:
+    elif not cli_args.build_only:
         if dev.exists():
             shutil.rmtree(dev)
         shutil.copytree(A7_WORK / 'device-a', dev, symlinks=True)
 
-    if not cli_args.repack_only:
+    if not cli_args.repack_only and not cli_args.build_only:
         # 1. Stage LiuqinAdreno730 driver & build script in isolated device-gpu
         drv_dir = dev / 'drivers/LiuqinAdreno730'
         (drv_dir / 'headers').mkdir(parents=True, exist_ok=True)
@@ -211,6 +238,128 @@ def main() -> None:
             + '\textern void liuqin_gpu_bringup_start(void);\n'
             + '\tliuqin_gpu_bringup_start();\n',
         )
+        if cli_args.with_input:
+            input_sources = SCRIPT_DIR.parent / 'r103-input'
+            input_driver = dev / 'drivers/LiuqinInput'
+            input_driver.mkdir(parents=True, exist_ok=True)
+            for source in input_sources.iterdir():
+                if source.suffix in ('.c', '.cpp', '.h', '.json'):
+                    shutil.copy2(source, input_driver / source.name)
+            shutil.copy2(input_sources / 'build-liuqin-input.py', dev / 'scripts/build-liuqin-input.py')
+            text = bt.read_text()
+            bt.write_text(text.replace(needle_bt, needle_bt + '\n  "build-liuqin-input.py",'))
+            text = dc.read_text()
+            library = '-Wl,-force_load,{tree}/build/liuqin-adreno730/libLiuqinAdreno730.a'
+            assert text.count(library) == 1
+            dc.write_text(text.replace(library, library + ' -Wl,-force_load,{tree}/build/liuqin-input/libLiuqinInput.a'))
+            new_bsd = new_bsd.replace(hook_needle, hook_needle + '\textern void liuqin_input_start(void);\n\tliuqin_input_start();\n')
+        if cli_args.with_wireless:
+            # Bridge LiuqinIdentityEthernet (en0) to WifiNet without altering IOEthernetController's vtable.
+            eth_cpp = dev / 'drivers/LiuqinIdentityEthernet/LiuqinIdentityEthernet.cpp'
+            eth_src = eth_cpp.read_text()
+            eth_src = eth_src.replace(
+                '#include <IOKit/IOPlatformExpert.h>\n',
+                '#include <IOKit/IOPlatformExpert.h>\n#include <IOKit/IODeviceTreeSupport.h>\n',
+                1,
+            )
+            eth_src = eth_src.replace(
+                'static constexpr UInt8 address[6]={0x02,0x4c,0x51,0x10,0x00,0x01};\n',
+                'static int (*volatile gWifiOutput)(mbuf_t);\n'
+                'static volatile bool gWifiLink;\n'
+                'static void liuqinRadioAddress(UInt8 m[6]) {\n'
+                '    UInt8 fallback[6]={0x02,0x4c,0x51,0x10,0x00,0x01};\n'
+                '    memcpy(m,fallback,6);\n'
+                '    IORegistryEntry *chosen=IORegistryEntry::fromPath("/chosen",gIODTPlane);\n'
+                '    OSData *id=chosen?OSDynamicCast(OSData,chosen->getProperty("unique-chip-id")):nullptr;\n'
+                '    uint64_t seed=0;\n'
+                '    if(id && id->getLength()>=sizeof(seed))memcpy(&seed,id->getBytesNoCopy(),sizeof(seed));\n'
+                '    OSSafeReleaseNULL(chosen);\n'
+                '    if(!seed)return;\n'
+                '    uint64_t h=0xcbf29ce484222325ull;\n'
+                '    for(unsigned i=0;i<8;++i)h=(h^((seed>>(8*i))&0xff))*0x100000001b3ull;\n'
+                '    for(unsigned i=0;i<6;++i)m[i]=(UInt8)(h>>(8*i));\n'
+                '    m[0]=(UInt8)((m[0]&0xfe)|0x02);\n'
+                '}\n',
+                1,
+            )
+            eth_src = eth_src.replace(
+                '    IOEthernetInterface *interface=nullptr;\n',
+                '    IOEthernetInterface *interface=nullptr;\n'
+                '    const IONetworkMedium *medium=nullptr;\n'
+                '    UInt8 address[6]={};\n'
+                '    bool enabled=false;\n',
+                1,
+            )
+            eth_src = eth_src.replace(
+                '        if(!IOEthernetController::start(provider))return false;\n'
+                '        OSDictionary *dict=OSDictionary::withCapacity(1);\n'
+                '        IONetworkMedium *medium=IONetworkMedium::medium(kIOMediumEthernetAuto,0);\n'
+                '        bool ok=dict && medium && IONetworkMedium::addMedium(dict,medium) && publishMediumDictionary(dict);\n'
+                '        OSSafeReleaseNULL(medium);OSSafeReleaseNULL(dict);\n',
+                '        liuqinRadioAddress(address);\n'
+                '        if(!IOEthernetController::start(provider))return false;\n'
+                '        OSDictionary *dict=OSDictionary::withCapacity(1);\n'
+                '        IONetworkMedium *m=IONetworkMedium::medium(IOMediumType(kIOMediumEthernetAuto)|IOMediumType(kIOMediumOptionFullDuplex),1000ULL*1000*1000);\n'
+                '        bool ok=dict && m && IONetworkMedium::addMedium(dict,m) && publishMediumDictionary(dict);\n'
+                '        medium=ok?IONetworkMedium::getMediumWithType(getMediumDictionary(),m->getType()):nullptr;\n'
+                '        OSSafeReleaseNULL(m);OSSafeReleaseNULL(dict);\n',
+                1,
+            )
+            eth_src = eth_src.replace(
+                '    IOReturn enable(IONetworkInterface *) override {setLinkStatus(kIONetworkLinkValid,nullptr);return kIOReturnSuccess;}\n'
+                '    IOReturn disable(IONetworkInterface *) override {setLinkStatus(kIONetworkLinkValid,nullptr);return kIOReturnSuccess;}\n'
+                '    UInt32 outputPacket(mbuf_t packet,void *) override {\n'
+                '        if(packet)freePacket(packet);\n'
+                '        return kIOReturnOutputDropped;\n'
+                '    }\n',
+                '    void wifiLink(bool up) {\n'
+                '        if(up && medium)setLinkStatus(kIONetworkLinkValid|kIONetworkLinkActive,medium,1000ULL*1000*1000);\n'
+                '        else setLinkStatus(kIONetworkLinkValid,nullptr);\n'
+                '    }\n'
+                '    bool isEnabled() const {return enabled;}\n'
+                '    IOReturn enable(IONetworkInterface *) override {enabled=true;wifiLink(gWifiLink);return kIOReturnSuccess;}\n'
+                '    IOReturn disable(IONetworkInterface *) override {enabled=false;setLinkStatus(kIONetworkLinkValid,nullptr);return kIOReturnSuccess;}\n'
+                '    UInt32 outputPacket(mbuf_t packet,void *) override {\n'
+                '        if(int (*out)(mbuf_t)=gWifiOutput){out(packet);return kIOReturnOutputSuccess;}\n'
+                '        if(packet)freePacket(packet);\n'
+                '        return kIOReturnOutputDropped;\n'
+                '    }\n',
+                1,
+            )
+            eth_src += (
+                '\nextern "C" bool sheng_ethernet_wifi_attach(int (*output)(mbuf_t)) {\n'
+                '    LiuqinIdentityEthernet *c=liveController;\n'
+                '    if(!c || !output)return false;\n'
+                '    gWifiLink=false; gWifiOutput=output;\n'
+                '    if(c->isEnabled())c->wifiLink(false);\n'
+                '    return true;\n'
+                '}\n'
+                'extern "C" void sheng_ethernet_wifi_link(bool up) {\n'
+                '    gWifiLink=up;\n'
+                '    LiuqinIdentityEthernet *c=liveController;\n'
+                '    if(c && c->isEnabled())c->wifiLink(up);\n'
+                '}\n'
+                'extern "C" ifnet_t sheng_ethernet_ifnet(void) {\n'
+                '    LiuqinIdentityEthernet *c=liveController;\n'
+                '    IOEthernetInterface *i=c?c->getIdentityInterface():nullptr;\n'
+                '    return i?i->getIfnet():nullptr;\n'
+                '}\n'
+            )
+            eth_cpp.write_text(eth_src)
+            wl_sources = SCRIPT_DIR.parent / 'r103-wireless'
+            wl_driver = dev / 'drivers/LiuqinWireless'
+            wl_driver.mkdir(parents=True, exist_ok=True)
+            for source in wl_sources.iterdir():
+                if source.suffix in ('.c', '.cpp', '.h'):
+                    shutil.copy2(source, wl_driver / source.name)
+            shutil.copy2(wl_sources / 'build-liuqin-wireless.py', dev / 'scripts/build-liuqin-wireless.py')
+            text = bt.read_text()
+            bt.write_text(text.replace(needle_bt, needle_bt + '\n  "build-liuqin-wireless.py",'))
+            text = dc.read_text()
+            library = '-Wl,-force_load,{tree}/build/liuqin-adreno730/libLiuqinAdreno730.a'
+            assert text.count(library) == 1
+            dc.write_text(text.replace(library, library + ' -Wl,-force_load,{tree}/build/liuqin-wireless/libLiuqinWireless.a'))
+            new_bsd = new_bsd.replace(hook_needle, hook_needle + '\textern void liuqin_bluetooth_start(void);\n\tliuqin_bluetooth_start();\n\textern void liuqin_wifi_pcie_start(void);\n\tliuqin_wifi_pcie_start();\n')
 
         prep = json.loads((A7_WORK / 'preparation.json').read_text())
         patch_chunks = []
@@ -237,6 +386,7 @@ def main() -> None:
 #include <libkern/zlib.h>
 #include <sys/xattr.h>
 extern int native_ram_block_gpu_addon(const uint8_t **, uint64_t *) __attribute__((weak_import));
+volatile int liuqin_addon_ready = 0;
 static voidpf lq_addon_zalloc(voidpf opaque __unused, uInt items, uInt size) {
 	size_t bytes = (size_t)items * size + 16;
 	uint8_t *blk = kalloc_data(bytes, Z_WAITOK | Z_ZERO);
@@ -324,10 +474,11 @@ static void liuqin_gpu_addon_install(proc_t p, user_addr_t scratch) {
 		if (nb < 2 || nb > 160 || bytes - at < npad + ppad || name[nb - 1]) { failed++; last_err = EINVAL; break; }
 		at += npad;
 		bool is_bundle = !strncmp(name, "GPUBundles/", 11);
+		bool is_library = is_bundle || !strncmp(name, "LaunchDaemons/", 14);
 		char path[192];
-		snprintf(path, sizeof(path), is_bundle ? "/Library/%s" : "/private/var/ngpu/%s", name);
+		snprintf(path, sizeof(path), is_library ? "/Library/%s" : "/private/var/ngpu/%s", name);
 		char dir[192]; strlcpy(dir, path, sizeof(dir));
-		for (size_t k = (is_bundle ? 9 : 1); dir[k]; ++k) {
+		for (size_t k = (is_library ? 9 : 1); dir[k]; ++k) {
 			if (dir[k] != '/') continue;
 			dir[k] = 0; (void)lq_mkdir_p(dir, p, scratch); dir[k] = '/';
 		}
@@ -363,12 +514,62 @@ static void liuqin_gpu_addon_install(proc_t p, user_addr_t scratch) {
 	}
 	printf("LQ102GPU ADDON files=%u written=%d failed=%d err=%d prot=%d prot_err=%d\n",
 	    count, written, failed, last_err, prot_ok, prot_err);
+	{
+		extern volatile int native_bindfs_boot_mount;
+		static const struct {
+			const char *src, *dst, *lower, *upper;
+		} kBtMounts[2] = {
+			{ "/private/var/ngpu/lib", "/usr/lib", "/usr/lib/dyld", "/usr/lib/QcaBTType0.dylib" },
+			{ "/private/var/ngpu/sbin", "/usr/sbin", "/usr/sbin/notifyd", "/usr/sbin/QcaBluetooth.runtime" },
+		};
+		int st[2] = { 0, 0 }, err[2] = { -1, -1 };
+		for (int mi = 0; mi < 2; ++mi) {
+			if (mi == 1 && (st[0] != 5 || err[0] != 0)) break;
+			vnode_t probe = NULLVP;
+			st[mi] = 1;
+			int e = vnode_lookup(kBtMounts[mi].src, 0, &probe, vfs_context_current());
+			if (e) { err[mi] = e; continue; }
+			vnode_put(probe); probe = NULLVP;
+			st[mi] = 2;
+			struct mount_args req = {
+				.type = scratch + 0x600,
+				.path = scratch + 0x620,
+				.flags = MNT_RDONLY | MNT_UNION,
+				.data = scratch + 0x700,
+			};
+			int32_t res = 0;
+			if ((e = copyout("bindfs", req.type, 7)) ||
+			    (e = copyout(kBtMounts[mi].dst, req.path, strlen(kBtMounts[mi].dst) + 1)) ||
+			    (e = copyout(kBtMounts[mi].src, req.data, strlen(kBtMounts[mi].src) + 1))) {
+				err[mi] = e; continue;
+			}
+			native_bindfs_boot_mount = 1;
+			e = mount(p, &req, &res);
+			native_bindfs_boot_mount = 0;
+			if (e) { err[mi] = e; continue; }
+			st[mi] = 3;
+			e = vnode_lookup(kBtMounts[mi].lower, 0, &probe, vfs_context_current());
+			if (!e) {
+				vnode_put(probe); probe = NULLVP;
+				st[mi] = 4;
+				e = vnode_lookup(kBtMounts[mi].upper, 0, &probe, vfs_context_current());
+				if (!e) { vnode_put(probe); probe = NULLVP; st[mi] = 5; }
+			}
+			err[mi] = e;
+		}
+		printf("LQ103 BT_RUNTIME lib=%d/%d sbin=%d/%d\n", st[0], err[0], st[1], err[1]);
+	}
+	__atomic_store_n(&liuqin_addon_ready, 1, __ATOMIC_RELEASE);
 }
 '''
         # Generate macOS 27.3 desktop skip-setup + auto-login seed data (matches scripts/make-macos-data-seed.py)
         def c_bytes(name: str, data: bytes) -> str:
             body = ','.join(str(b) for b in data) if data else '0'
-            return f'static const uint8_t {name}[{max(1, len(data))}] = {{{body}}};\nstatic const uint32_t {name}_len = {len(data)}u;\n'
+            return (
+                f'static const uint8_t {name}[{max(1, len(data))}] '
+                f'__attribute__((section("__BOOTDATA,__data"))) = {{{body}}};\n'
+                f'static const uint32_t {name}_len = {len(data)}u;\n'
+            )
 
         skip_items = [
             'Accessibility', 'AdditionalPrivacySettings', 'Appearance', 'AppleID', 'AppStore',
@@ -413,6 +614,49 @@ static void liuqin_gpu_addon_install(proc_t p, user_addr_t scratch) {
             'com.apple.SubmitDiagInfo': True,
             'com.apple.spindump': True,
             'com.apple.tailspind': True,
+            'com.apple.ReportCrash': True,
+            'com.apple.ReportCrash.Root': True,
+            'com.apple.osanalytics.osanalyticshelper': True,
+            'com.apple.photoanalysisd': True,
+            'com.apple.mediaanalysisd': True,
+            'com.apple.softwareupdated': True,
+            'com.apple.mobileassetd.v2': True,
+            'com.apple.mobileassetd': True,
+        }, fmt=plistlib.FMT_XML)
+        disabled_user_plist = plistlib.dumps({
+            'com.apple.chronod': True,
+            'com.apple.contextstored': True,
+            'com.apple.ContextStoreAgent': True,
+            'com.apple.imagent': True,
+            'com.apple.callservicesd': True,
+            'com.apple.identityservicesd': True,
+            'com.apple.BiomeAgent': True,
+            'com.apple.biomesyncd': True,
+            'com.apple.bird': True,
+            'com.apple.cloudd': True,
+            'com.apple.itunescloudd': True,
+            'com.apple.corespotlightd': True,
+            'com.apple.spotlightknowledged': True,
+            'com.apple.donotdisturbd': True,
+            'com.apple.homed': True,
+            'com.apple.routined': True,
+            'com.apple.duetexpertd': True,
+            'com.apple.knowledge-agent': True,
+            'com.apple.ReportCrash': True,
+            'com.apple.photoanalysisd': True,
+            'com.apple.mediaanalysisd': True,
+            'com.apple.photolibraryd': True,
+            'com.apple.corespeechd': True,
+            'com.apple.localspeechrecognition': True,
+            'com.apple.assistantd': True,
+            'com.apple.siriinferenced': True,
+            'com.apple.siriknowledged': True,
+            'com.apple.generativeexperiencesd': True,
+            'com.apple.intelligenceplatformd': True,
+            'com.apple.intelligenceflowd': True,
+            'com.apple.modelcatalogd': True,
+            'com.apple.SetStoreUpdateService': True,
+            'com.apple.ScreenTimeAgent': True,
         }, fmt=plistlib.FMT_XML)
 
         desktop_seed_c = (
@@ -422,6 +666,7 @@ static void liuqin_gpu_addon_install(proc_t p, user_addr_t scratch) {
             + c_bytes('lq_seed_kcpassword', kc_data)
             + c_bytes('lq_seed_tu_debug', tu_debug_data)
             + c_bytes('lq_seed_disabled_plist', disabled_plist)
+            + c_bytes('lq_seed_disabled_user_plist', disabled_user_plist)
             + r'''
 static int lq_write_owned(proc_t p, user_addr_t scratch, const char *path, const uint8_t *data, uint32_t sz, int mode, uint32_t uid, uint32_t gid) {
 	vfs_context_t kctx = vfs_context_kernel();
@@ -467,6 +712,8 @@ static void liuqin_desktop_seed_install(proc_t p, user_addr_t scratch) {
 	e = lq_write_owned(p, scratch, "/private/var/ngpu/tu_debug", lq_seed_tu_debug, lq_seed_tu_debug_len, 0644, 0, 0);
 	if (e) { fail++; last_err = e; } else ok++;
 	e = lq_write_owned(p, scratch, "/private/var/db/com.apple.xpc.launchd/disabled.plist", lq_seed_disabled_plist, lq_seed_disabled_plist_len, 0644, 0, 0);
+	if (e) { fail++; last_err = e; } else ok++;
+	e = lq_write_owned(p, scratch, "/private/var/db/com.apple.xpc.launchd/disabled.501.plist", lq_seed_disabled_user_plist, lq_seed_disabled_user_plist_len, 0644, 0, 0);
 	if (e) { fail++; last_err = e; } else ok++;
 	e = lq_write_owned(p, scratch, "/private/var/db/.AppleSetupDone", empty, 0, 0644, 0, 0);
 	if (e) { fail++; last_err = e; } else ok++;
@@ -538,7 +785,9 @@ static void liuqin_desktop_seed_install(proc_t p, user_addr_t scratch) {
             ' \t\tunsigned user_probe=0;\n'
             ' \t\tif (!probe_error && layout==1 && PE_parse_boot_argn("liuqin-mount-probe",&user_probe,sizeof(user_probe)) && user_probe==1) {\n'
         )
-        # Silence kernel debug matrix/green-square painters in bsd/dev/liuqin_debug.c once WindowServer takes over (liuqin_fb_suspend(1))
+        # The desktop build keeps diagnostics in the USB ring. Disable the
+        # matrix/status painters from boot, including callers which bypass
+        # the scrolling console's suspend flag.
         orig_dbg = (A7_WORK / 'staged-sources/bsd/dev/liuqin_debug.c').read_text()
         dbg_target = (
             'static volatile uint32_t *\n'
@@ -548,8 +797,14 @@ static void liuqin_desktop_seed_install(proc_t p, user_addr_t scratch) {
         assert orig_dbg.count(dbg_target) == 1
         new_dbg = orig_dbg.replace(
             dbg_target,
-            'static int lq_fb_suspended;\n\n' + dbg_target + '\tif (lq_fb_suspended) {\n\t\treturn NULL;\n\t}\n',
+            'static int lq_fb_suspended;\n\n' + dbg_target + '\treturn NULL; /* Desktop: debug painters disabled. */\n',
         )
+        assert new_dbg.count('volatile int liuqin_debug_mute;') == 1
+        if not cli_args.usb_debug:
+            new_dbg = new_dbg.replace('volatile int liuqin_debug_mute;',
+                                      'volatile int liuqin_debug_mute = 1; /* USB mirror explicitly disabled. */')
+        new_dbg = new_dbg.replace('liuqin_debug_at_line_start(void)\n{\n',
+                                  'liuqin_debug_at_line_start(void)\n{\n\tif (liuqin_debug_mute) return 1;\n')
         assert new_dbg.count('static int lq_fb_suspended;\n') == 2
         new_dbg = new_dbg.replace(
             'static int lq_fb_suspended;\nstatic vm_map_t lq_init_map;\n',
@@ -559,12 +814,54 @@ static void liuqin_desktop_seed_install(proc_t p, user_addr_t scratch) {
             orig_dbg.splitlines(True), new_dbg.splitlines(True),
             fromfile='a/bsd/dev/liuqin_debug.c', tofile='b/bsd/dev/liuqin_debug.c',
         ))
-        (dev / 'patches/xnu' / addon_patch_name).write_text(hdr_diff + kern_exec_diff + dbg_diff)
+        # On Qualcomm SM8475, changing a page's cache attribute from Write-Back to Write-Combining
+        # (VM_WIMG_WCOMB) in pmap_batch_set_cache_attributes_internal() does not flush dirty lines
+        # of the VM's cacheable zero-fill. Without pmap_sync_wimg(), stale zero-fill lines evict
+        # over WC GPU BOs in DRAM and trip the WC audit / GPU hang (matching UniXNU-sheng's fix
+        # in osfmk/arm/pmap/pmap.c — the pmap compiled by DEVELOPMENT_ARM64_BCM2837).
+        pmap_diff = (
+            '--- a/osfmk/arm/pmap/pmap.c\n'
+            '+++ b/osfmk/arm/pmap/pmap.c\n'
+            '@@ -6027,7 +6027,7 @@\n'
+            ' \t\tpte |= ARM_PTE_NX | ARM_PTE_PNX;\n'
+            ' \t\tbreak;\n'
+            ' \tcase VM_WIMG_RT:\n'
+            '-\t\tif (is_dram_addr(pa)) {\n'
+            '+\t\tif (is_dram_addr(pa) || pa_valid(pa)) {\n'
+            ' \t\t\tpte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_RT);\n'
+            ' \t\t} else {\n'
+            ' #if HAS_FEAT_XS\n'
+            '@@ -6067,7 +6067,7 @@\n'
+            ' \t\tpte |= ARM_PTE_NX | ARM_PTE_PNX;\n'
+            ' \t\tbreak;\n'
+            ' \tcase VM_WIMG_WCOMB:\n'
+            '-\t\tif (is_dram_addr(pa)) {\n'
+            '+\t\tif (is_dram_addr(pa) || pa_valid(pa)) {\n'
+            ' \t\t\tpte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);\n'
+            ' \t\t} else {\n'
+            ' #if HAS_FEAT_XS\n'
+            '@@ -10979,6 +10979,10 @@\n'
+            ' \t\t\t}\n'
+            ' \n'
+            ' \t\t\tpvh_unlock(pai);\n'
+            '+\n'
+            '+\t\t\tif (wimg_bits_new != wimg_bits_prev && wimg_bits_new != VM_WIMG_RT) {\n'
+            '+\t\t\t\tpmap_sync_wimg(pn, wimg_bits_prev, wimg_bits_new);\n'
+            '+\t\t\t}\n'
+            ' \n'
+            ' \t\t\tpage_index++;\n'
+            ' \n'
+        )
+        (dev / 'patches/xnu' / addon_patch_name).write_text(hdr_diff + kern_exec_diff + dbg_diff + pmap_diff)
         series_p = dev / 'patches/xnu/series'
         series_txt = series_p.read_text()
         if addon_patch_name not in series_txt:
             series_p.write_text(series_txt.rstrip('\n') + '\n' + addon_patch_name + '\n')
+        if cli_args.persistent_data != 'none':
+            storage = load_mod('liuqin_persistent_storage', SCRIPT_DIR.parent / 'r103-storage/stage-storage.py')
+            storage.stage(dev, addon_hdr)
 
+    if not cli_args.repack_only:
         # 5. Build kernel via UniXNU CLI (reuses warm tree)
         sys.path.insert(0, str(ROOT / 'scripts'))
         from unixnu import cli, feeds
@@ -619,21 +916,27 @@ static void liuqin_desktop_seed_install(proc_t p, user_addr_t scratch) {
     shutil.copyfile(ref_fat, fat)
     a7_val = json.loads((A7_WORK / 'evidence/a/validation-summary.json').read_text())
     args = a7_val['kernel_args']
-    # Drop redundant liuqin_caches=1 (default is already 1) to make room for /usr/libexec/logd_helper in deny-exec
-    # (prevents logd_helper from writing 7 GiB of uuidtext into the 512 MiB volatile Data ramdisk -> ENOSPC storm).
+    assert args.split().count('liuqin_usb=1') == 1, 'Expected enabled USB debug in A7 baseline'
+    if not cli_args.usb_debug:
+        args = args.replace('liuqin_usb=1', 'liuqin_usb=0')
+    # Drop redundant liuqin_caches=1 (default is already 1); logd_helper is already denied in kern_exec.c,
+    # keeping kernel_args comfortably under 1023 bytes for vsync=120 and input/data/wireless switches.
     args = args.replace(' liuqin_caches=1', '')
-    if '/usr/libexec/logd_helper' not in args and 'deny-exec=' in args:
-        args = args.replace(
-            '/usr/libexec/audiomxd',
-            '/usr/libexec/audiomxd,/usr/libexec/logd_helper',
-            1,
-        )
-    for extra_arg in ('vsync=60',):
+    if cli_args.with_wireless:
+        args = args.replace(',/usr/sbin/bluetoothd', '')
+    for extra_arg in ('vsync=120', 'no-lc=1'):
         if extra_arg.split('=')[0] + '=' not in args:
             args = args + ' ' + extra_arg
+    if cli_args.with_input:
+        # This baseline flag only rewrites a plist already installed by the
+        # desktop seed. Reuse its command-line space for the input switch.
+        args = args.replace(' liuqin-disable-daemons=1', '')
+        args += ' liuqin-input=1'
+    if cli_args.persistent_data != 'none':
+        args += ' liuqin-data=' + {'reuse': '1', 'init': '2', 'format': '3'}[cli_args.persistent_data]
     assert len(args) < 1023, f'kernel_args too long ({len(args)} >= 1023)'
     raw_adt = (A7_WORK / 'evidence/a/kernel.macho.adt').read_bytes()
-    raw_adt = adt_add_gpu_addon(raw_adt, add_gpu_addon=bool(cli_args.gpu_addon))
+    raw_adt = adt_add_gpu_addon(raw_adt, add_gpu_addon=bool(cli_args.gpu_addon), add_bluetooth=bool(cli_args.with_wireless))
     config = run(['mtype', '-i', fat, '::/EFI/UniXNU/unixnu.toml']).decode()
     current = tomllib.loads(config)['entry'][0]['args']
     config = config.replace(current, args)
@@ -653,7 +956,8 @@ static void liuqin_desktop_seed_install(proc_t p, user_addr_t scratch) {
         orig_tc = ev / 'kernel.macho.trustcache.orig'
         new_tc = ev / 'kernel.macho.trustcache'
         orig_tc.write_bytes(run(['mtype', '-i', fat, '::/EFI/UniXNU/Payloads/kernel.macho.trustcache']))
-        run(['python3', ROOT / 'scripts/trust-append-module.py', orig_tc, new_tc, tj['cdhash'], tj['turnip_cdhash']])
+        cdhashes = [tj['cdhash'], tj['turnip_cdhash']] + list(tj.get('extra_cdhashes', []))
+        run(['python3', ROOT / 'scripts/trust-append-module.py', orig_tc, new_tc, *cdhashes])
         copies.append((new_tc, '::/EFI/UniXNU/Payloads/kernel.macho.trustcache'))
     for src, dest in copies:
         run(['mcopy', '-o', '-i', fat, src, dest])
@@ -684,6 +988,11 @@ static void liuqin_desktop_seed_install(proc_t p, user_addr_t scratch) {
         'text_const_vma': hex(sections['__TEXT,__const']),
         'aes_gate': gate_j['status'],
         'trust_cache_sha256': trust_sha,
+        'kernel_args': args,
+        'usb_debug': cli_args.usb_debug,
+        'input_port': cli_args.with_input,
+        'persistent_data_mode': cli_args.persistent_data,
+        'hardware_verified': False,
     }
     (ev / 'validation-summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     print(json.dumps(summary, indent=2))

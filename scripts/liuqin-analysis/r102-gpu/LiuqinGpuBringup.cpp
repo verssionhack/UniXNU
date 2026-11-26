@@ -102,6 +102,8 @@ extern volatile uint32_t native_adreno_table_switches[8];
 extern volatile uint32_t native_adreno_cp_check[6];
 extern volatile uint32_t native_adreno_view_diag[6];
 extern volatile uint32_t native_adreno_wc_audit[6];
+extern volatile uint32_t native_adreno_wc_distrusted;
+extern volatile uint32_t native_adreno_bo_contig[2];
 extern volatile uint32_t native_adreno_coherence[8];
 extern volatile uint32_t native_adreno_ib_log[4][4 + 28];
 extern volatile uint32_t native_adreno_ib_log_count;
@@ -127,6 +129,7 @@ extern volatile uint32_t native_legacy_stage, native_legacy_swap_accepted_count,
                          native_legacy_transfer_calls, native_legacy_retirement_calls,
                          native_legacy_frame_count, native_legacy_client_calls,
                          native_legacy_swapstat[16], native_legacy_call_diag[16],
+                         native_legacy_direct[14], native_legacy_dpu_db[4],
                          native_legacy_pm_stage, native_legacy_pm_calls,
                          native_legacy_pm_callbacks, native_legacy_pm_ordinal;
 extern volatile int native_legacy_transfer_status, native_legacy_pm_status;
@@ -209,6 +212,7 @@ struct GpuState {
     };
     uint8_t *cmdDb = nullptr;
     uint32_t perfVote[2]{};
+    volatile uint32_t dcvsPaused = 0;
     bool zapLoaded = false;
     volatile bool irqAttached = false;
     volatile uint32_t irqCount = 0;
@@ -1055,7 +1059,8 @@ void gpuBringupWorker(void *, wait_result_t) {
     gS->coldDevice.io.write32(gS->coldDevice.io.cookie, ShengGmuCore, kG2hMask, ~(1u << 23));
     gS->coldDevice.io.barrier(gS->coldDevice.io.cookie);
     uint32_t gxBefore = gmuRd(0x1f8d0);
-    unsigned perf = 1u, bw = 1u;
+    unsigned perf = 10u, bw = 1u;
+    PE_parse_boot_argn("gpu-perf", &perf, sizeof(perf));
     perf = ShengGmuPerfVote(perf, &bw);
     gS->perfVote[0] = perf; gS->perfVote[1] = bw;
     const uint32_t vote[3] = {1u, perf, bw};
@@ -1226,7 +1231,9 @@ void gpuBringupWorker(void *, wait_result_t) {
         native_adreno_cached_read32 = cachedRead32;
         native_adreno_line_audit = lineAudit;
         coherenceProbe(vm);
-        native_adreno_wc_enabled = 0u;
+        unsigned gpuWc = 1u;
+        PE_parse_boot_argn("gpu-wc", &gpuWc, sizeof(gpuWc));
+        native_adreno_wc_enabled = gpuWc ? 1u : 0u;
         openCpAperture();
         IOReturn tSt = gS->timer.attach(&kTimerIo, NativeAdrenoTimeCp);
         const unsigned ias = NativeAdrenoGpuContextInputBits();
@@ -1234,8 +1241,9 @@ void gpuBringupWorker(void *, wait_result_t) {
         native_adreno_set_restart(gpuRestart, nullptr);
         IOReturn pubSt = native_adreno_publish(vm, &gS->submit, &gS->ring, &clock,
                                                tSt ? nullptr : &gS->timer, &gS->devInfo, ias, 40);
-        IOLog("LQ102GPU PUBLISH st=0x%x timer=0x%x ias=%u va_size=0x%llx table_mode=%u cpchk=%x,%x,%x,%x,%x,%x\n",
+        IOLog("LQ102GPU PUBLISH st=0x%x timer=0x%x ias=%u va_size=0x%llx wc=%u perf=%u/%u table_mode=%u cpchk=%x,%x,%x,%x,%x,%x\n",
               unsigned(pubSt), unsigned(tSt), ias, (unsigned long long)gS->devInfo.va_size,
+              native_adreno_wc_enabled, gS->perfVote[0], gS->perfVote[1],
               native_adreno_cp_aperture[3],
               native_adreno_cp_check[0], native_adreno_cp_check[1], native_adreno_cp_check[2],
               native_adreno_cp_check[3], native_adreno_cp_check[4], native_adreno_cp_check[5]);
@@ -1244,6 +1252,115 @@ void gpuBringupWorker(void *, wait_result_t) {
         if (!pubSt) {
             publishMetalAccelerator();
             usbFlush();
+        }
+        unsigned dcvsEn = 1u;
+        PE_parse_boot_argn("gpu-dcvs", &dcvsEn, sizeof(dcvsEn));
+        if (dcvsEn) {
+            auto dcvsWorker = [](void *, wait_result_t) {
+                static const uint32_t kMHz[13] = {0, 220, 285, 317, 350, 421, 492, 545, 599, 640, 734, 791, 818};
+                ShengGmuIo &io = gS->coldDevice.io;
+                unsigned top = gS->perfVote[0] ? gS->perfVote[0] : 10u;
+                if (top < 1u) top = 1u;
+                if (top > 12u) top = 12u;
+                unsigned floor = 1u;
+                PE_parse_boot_argn("gpu-dcvs-min", &floor, sizeof(floor));
+                if (floor < 1u) floor = 1u;
+                if (floor > top) floor = top;
+                io.write32(io.cookie, ShengGmuCore, kGmuReg(0x23b0e), 0xff000000u);
+                uint32_t sel = 0;
+                io.read32(io.cookie, ShengGmuCore, kGmuReg(0x1f841), &sel);
+                io.write32(io.cookie, ShengGmuCore, kGmuReg(0x1f841), (sel & ~0xffu) | (1u << 5));
+                io.write32(io.cookie, ShengGmuCore, kGmuReg(0x1f840), 1u);
+                io.barrier(io.cookie);
+                auto readBusy = [&]() -> uint64_t {
+                    uint32_t hi = 0, lo = 0, hi2 = 0;
+                    io.read32(io.cookie, ShengGmuCore, kGmuReg(0x1f845), &hi);
+                    io.read32(io.cookie, ShengGmuCore, kGmuReg(0x1f844), &lo);
+                    io.read32(io.cookie, ShengGmuCore, kGmuReg(0x1f845), &hi2);
+                    if (hi2 != hi) io.read32(io.cookie, ShengGmuCore, kGmuReg(0x1f844), &lo);
+                    return (uint64_t(hi2) << 32) | lo;
+                };
+                auto voteLevel = [&](unsigned lvl) -> bool {
+                    if (__atomic_load_n(&gS->dcvsPaused, __ATOMIC_ACQUIRE) || native_adreno_recovery[0] != native_adreno_recovery[1])
+                        return false;
+                    unsigned bw = 1u;
+                    lvl = ShengGmuPerfVote(lvl, &bw);
+                    const uint32_t v[3] = {1u, lvl, bw};
+                    uint32_t out[16] = {}, err = 0;
+                    size_t cnt = 0;
+                    if (AdrenoHfiExchange(&gS->coldDevice.hfi, 30, v, 3, 1000, hfiWait, out, 16, &cnt, &err) || err) {
+                        native_gpu_dcvs[3] = native_gpu_dcvs[3] + 1;
+                        return false;
+                    }
+                    gS->perfVote[0] = lvl; gS->perfVote[1] = bw;
+                    native_gpu_dcvs[1] = lvl;
+                    native_gpu_dcvs[2] = native_gpu_dcvs[2] + 1;
+                    return true;
+                };
+                unsigned cur = top, downStreak = 0, hold = 0;
+                uint64_t lastBusy = readBusy(), lastT = mach_absolute_time(), idleSince = lastT;
+                uint64_t winBusy = 0, winNs = 0;
+                bool idle = false;
+                native_gpu_dcvs[0] = 1; native_gpu_dcvs[1] = cur;
+                for (;;) {
+                    IOSleep(20);
+                    if (__atomic_load_n(&gS->dcvsPaused, __ATOMIC_ACQUIRE)) continue;
+                    const uint64_t busy = readBusy(), t = mach_absolute_time();
+                    uint64_t ns = 0;
+                    absolutetime_to_nanoseconds(t - lastT, &ns);
+                    uint64_t busyNs = (busy - lastBusy) * 625ULL / 12ULL;
+                    if (busyNs > ns) busyNs = ns;
+                    lastBusy = busy; lastT = t;
+                    if (!ns) continue;
+                    winBusy += busyNs; winNs += ns;
+                    if (winNs >= 2000000000ULL) {
+                        native_gpu_dcvs[4] = uint32_t((winBusy * 100ULL) / winNs);
+                        winBusy = 0; winNs = 0;
+                    }
+                    const bool active = (busyNs > 0) || (gpuRd(A740_CP_RB_RPTR) != gpuRd(A740_CP_RB_WPTR));
+                    unsigned want = cur;
+                    if (active) {
+                        idleSince = t;
+                        if (idle) {
+                            idle = false;
+                            want = top >= 7u ? 7u : top;
+                            hold = 3;
+                            downStreak = 0;
+                        } else if (busyNs * 100ULL >= ns * 80ULL) {
+                            want = top;
+                            hold = 4;
+                            downStreak = 0;
+                        } else {
+                            const uint64_t needMHz = (busyNs * kMHz[cur] * 2ULL) / ns;
+                            if (needMHz > kMHz[cur] && cur < top) {
+                                unsigned up = cur + 1;
+                                while (up < top && kMHz[up] < needMHz) ++up;
+                                want = up;
+                                hold = 3;
+                                downStreak = 0;
+                            } else if (hold) {
+                                --hold;
+                            } else if (cur > floor && needMHz * 10ULL <= uint64_t(kMHz[cur - 1]) * 7ULL) {
+                                if (++downStreak >= 4) { want = cur - 1; downStreak = 0; }
+                            } else {
+                                downStreak = 0;
+                            }
+                        }
+                    } else {
+                        uint64_t idleNs = 0;
+                        absolutetime_to_nanoseconds(t - idleSince, &idleNs);
+                        if (idleNs >= 80000000ULL) {
+                            idle = true;
+                            want = floor;
+                            hold = 0;
+                            downStreak = 0;
+                        }
+                    }
+                    if (want != cur && voteLevel(want)) cur = want;
+                }
+            };
+            thread_t dth = nullptr;
+            if (kernel_thread_start(dcvsWorker, nullptr, &dth) == KERN_SUCCESS) thread_deallocate(dth);
         }
     }
 
@@ -1261,11 +1378,15 @@ void gpuBringupWorker(void *, wait_result_t) {
         uint32_t m1 = mt >= 3 ? d.marks[(mt - 3) & 15] : 0;
         uint32_t m2 = mt >= 2 ? d.marks[(mt - 2) & 15] : 0;
         uint32_t m3 = mt >= 1 ? d.marks[(mt - 1) & 15] : 0;
-        IOLog("LQ102GPU STAT t=%u gpu(open=%u call=%u sub=%u ret=%u hang=%u/%u views=%u/%u/%u marks=%u:%x,%x,%x,%x opener=%.16s)\n",
+        IOLog("LQ102GPU STAT t=%u gpu(open=%u call=%u sub=%u ret=%u hang=%u/%u dcvs=%u/%u/%u%% wc=%u:%u/%u/%u/%u/%u contig=%u/%u views=%u/%u/%u marks=%u:%x,%x,%x,%x opener=%.16s)\n",
               tick * 5, d.opens, d.calls, sub, ret, native_adreno_recovery[0], native_adreno_recovery[1],
+              native_gpu_dcvs[1], native_gpu_dcvs[2], native_gpu_dcvs[4],
+              native_adreno_wc_enabled, native_adreno_wc_distrusted, native_adreno_wc_audit[0],
+              native_adreno_wc_audit[2], native_adreno_wc_audit[3], native_adreno_wc_audit[4],
+              native_adreno_bo_contig[0], native_adreno_bo_contig[1],
               native_adreno_view_diag[0], native_adreno_view_diag[1], native_adreno_view_diag[3],
               mt, m0, m1, m2, m3, d.opener[0]);
-        IOLog("LQ102GPU DISP t=%u stg=%u cli=%u acc=%u rej=%u(r=%u w=%llu h=%llu fmt=0x%llx pl=%llu st=%llu al=%llu dl=%llu sz=%ux%u r0=%u,%u,%u,%u ms=%x,%x,%x op=%x,%x,%x) xfer=%u(0x%x) copy=%llu ret=%u frm=%u ss=%u,%u,%u,%u,%u\n",
+        IOLog("LQ102GPU DISP t=%u stg=%u cli=%u acc=%u rej=%u(r=%u w=%llu h=%llu fmt=0x%llx pl=%llu st=%llu al=%llu dl=%llu sz=%ux%u r0=%u,%u,%u,%u ms=%x,%x,%x op=%x,%x,%x) xfer=%u(0x%x) copy=%llu ret=%u frm=%u ss=%u,%u,%u,%u,%u fw=%u/%u/%u db=%u/%u/%u/%x\n",
               tick * 5, native_legacy_stage, native_legacy_client_calls,
               native_legacy_swap_accepted_count, native_legacy_swap_rejected_count, native_legacy_rej_reason,
               (unsigned long long)native_legacy_rej_surface[0], (unsigned long long)native_legacy_rej_surface[1],
@@ -1280,7 +1401,9 @@ void gpuBringupWorker(void *, wait_result_t) {
               native_legacy_transfer_calls, (unsigned)native_legacy_transfer_status,
               (unsigned long long)native_legacy_copy_n, native_legacy_retirement_calls, native_legacy_frame_count,
               native_legacy_swapstat[0], native_legacy_swapstat[1], native_legacy_swapstat[3],
-              native_legacy_swapstat[7], native_legacy_swapstat[11]);
+              native_legacy_swapstat[7], native_legacy_swapstat[11],
+              native_legacy_direct[9], native_legacy_direct[11], native_legacy_direct[13],
+              native_legacy_dpu_db[0], native_legacy_dpu_db[1], native_legacy_dpu_db[2], native_legacy_dpu_db[3]);
         {
             char prepBuf[224];
             prepBuf[0] = 0;

@@ -17,8 +17,15 @@ static const uint64_t kGpuHz[LIUQIN_GPU_OPPS] = {
     492000000ULL, 545000000ULL, 599000000ULL, 640000000ULL, 734000000ULL, 791000000ULL, 818000000ULL
 };
 static const uint32_t kGpuLevels[LIUQIN_GPU_OPPS] = {
-    0u, 56u, 56u, 64u, 64u, 80u, 128u, 144u, 192u, 224u, 256u, 320u, 384u
+    0u, 48u, 56u, 64u, 80u, 96u, 128u, 144u, 192u, 192u, 256u, 320u, 384u
 };
+/* Stock Adreno730v3 HFI perf table carries a dependent CX corner for every GX OPP
+ * (adapted from linux-sm8450-liuqin commit d54edba91: sm8475-xiaomi-liuqin.dts). */
+static const uint32_t kGpuCxLevels[LIUQIN_GPU_OPPS] = {
+    0u, 64u, 64u, 64u, 128u, 128u, 128u, 192u, 192u, 192u, 256u, 320u, 384u
+};
+uint32_t liuqin_gx_cx_votes[16];
+unsigned liuqin_has_gx_cx_votes;
 /* Map each GPU OPP (1..12) to an A730 static BW level (1..11) */
 static const uint32_t kGpuOppToBw[LIUQIN_GPU_OPPS] = {
     0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 11u, 11u
@@ -62,6 +69,23 @@ AdrenoHfiStartupStatus ShengGmuBuildStartup(const ShengGmuVoteInputs *in, Adreno
     c.gpu_count = LIUQIN_GPU_OPPS;
     for (unsigned i = 0; i < LIUQIN_GPU_OPPS; ++i) {
         c.gpu[i] = (AdrenoHfiPerformanceLevel){ kGpuHz[i], votes[i] };
+    }
+    /* Compute GX-dependent CX HLVL indices from live cmd-db cx.lvl (linux-sm8450-liuqin d54edba91). */
+    liuqin_has_gx_cx_votes = 0u;
+    for (unsigned i = 0; i < 16u; ++i) liuqin_gx_cx_votes[i] = 0u;
+    if (in->cx.data && in->cx.bytes >= 2u && !(in->cx.bytes & 1u)) {
+        const size_t ncx = in->cx.bytes / 2u;
+        unsigned ok = 1u;
+        for (unsigned i = 1u; i < LIUQIN_GPU_OPPS; ++i) {
+            size_t j = 0;
+            for (; j < ncx; ++j) {
+                const uint16_t corner = (uint16_t)(in->cx.data[2u * j] | ((uint16_t)in->cx.data[2u * j + 1u] << 8));
+                if (corner >= kGpuCxLevels[i]) break;
+            }
+            if (j == ncx) { ok = 0u; break; }
+            liuqin_gx_cx_votes[i] = (uint32_t)j;
+        }
+        if (ok) liuqin_has_gx_cx_votes = 1u;
     }
 
     if (AdrenoHfiArcVotes(kGmuLevels, LIUQIN_GMU_OPPS, in->cx.data, in->cx.bytes,

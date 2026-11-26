@@ -324,6 +324,78 @@ static int startup_health(void *cookie)
     return r->health_status != ShengGmuSuccess;
 }
 
+extern uint32_t liuqin_gx_cx_votes[16];
+extern unsigned liuqin_has_gx_cx_votes;
+
+static AdrenoHfiStartupStatus liuqin_hfi_startup_run(AdrenoHfiStartup *state, AdrenoHfi *h,
+    const AdrenoHfiStartupConfig *c, const AdrenoHfiStartupServices *s, AdrenoHfiStartupResult *r)
+{
+    if (!r) return AdrenoHfiStartupInvalid;
+    *r = (AdrenoHfiStartupResult){0};
+    r->resources_must_retain = 1;
+    if (!state || !h || AdrenoHfiStartupValidateServices(s) != AdrenoHfiStartupSuccess ||
+        AdrenoHfiStartupValidate(c) != AdrenoHfiStartupSuccess)
+        return AdrenoHfiStartupInvalid;
+    if (state->poisoned || h->poisoned) return AdrenoHfiStartupPoisoned;
+    if (state->attempted || state->completed || h->pending_header) return AdrenoHfiStartupBusy;
+    uint64_t begin = 0, last = 0, command = 0, now = 0;
+    if (s->now_us(s->cookie, &begin)) return AdrenoHfiStartupClockError;
+    last = begin;
+    if (s->check_health(s->cookie)) return AdrenoHfiStartupPlatformFault;
+    state->attempted = 1;
+    AdrenoHfiStartupStatus status = AdrenoHfiStartupSuccess;
+    uint32_t payload[159], output[16], id = 0;
+    size_t words = 0, returned = 0;
+    for (unsigned step = AdrenoHfiStagePerformance; step <= AdrenoHfiStageStart; ++step) {
+        if ((step == AdrenoHfiStageAcdEnable || step == AdrenoHfiStageAcdTable) && !c->acd_enable_mask) continue;
+        if (step == AdrenoHfiStageIfpc && !c->enable_ifpc) continue;
+        r->stage = (AdrenoHfiStartupStage)step;
+        command = last;
+        if (s->now_us(s->cookie, &now) || now < last) { status = AdrenoHfiStartupClockError; goto failed; }
+        last = now; r->elapsed_us = now - begin;
+        if (now - begin >= s->total_timeout_us || now - command >= s->command_timeout_us) { status = AdrenoHfiStartupTimeout; goto failed; }
+        if (s->check_health(s->cookie)) { status = AdrenoHfiStartupPlatformFault; goto failed; }
+        status = AdrenoHfiStartupEncode(c, r->stage, &id, payload, 159, &words);
+        if (status) goto failed;
+        /* Port of linux-sm8450-liuqin d54edba91: populate GX-dependent CX corner indices in perf table. */
+        if (step == AdrenoHfiStagePerformance && liuqin_has_gx_cx_votes) {
+            for (unsigned i = 0; i < c->gpu_count && i < 16u; ++i)
+                payload[3u + 3u * i] = liuqin_gx_cx_votes[i];
+        }
+        r->wire_header = 0;
+        r->transport_status = AdrenoHfiSend(h, id, payload, words, &r->wire_header);
+        if (r->wire_header) ++r->published_commands;
+        if (r->transport_status != AdrenoHfiSuccess) { status = AdrenoHfiStartupTransportError; goto failed; }
+        unsigned acknowledged = 0;
+        for (unsigned i = 0; i < s->polls_per_command; ++i) {
+            if (s->now_us(s->cookie, &now) || now < last) { status = AdrenoHfiStartupClockError; goto failed; }
+            last = now; r->elapsed_us = now - begin;
+            if (now - begin >= s->total_timeout_us || now - command >= s->command_timeout_us) { status = AdrenoHfiStartupTimeout; goto failed; }
+            if (s->check_health(s->cookie)) { status = AdrenoHfiStartupPlatformFault; goto failed; }
+            ++r->poll_reads;
+            r->transport_status = AdrenoHfiPoll(h, output, 16, &returned, &r->firmware_error);
+            if (r->transport_status == AdrenoHfiSuccess) {
+                if (s->now_us(s->cookie, &now) || now < last) { status = AdrenoHfiStartupClockError; goto failed; }
+                last = now; r->elapsed_us = now - begin;
+                if (s->check_health(s->cookie)) { status = AdrenoHfiStartupPlatformFault; goto failed; }
+                r->acknowledged_stages |= 1u << step;
+                acknowledged = 1;
+                break;
+            }
+            if (r->transport_status != AdrenoHfiEmpty) { status = AdrenoHfiStartupTransportError; goto failed; }
+            if (i + 1 < s->polls_per_command && s->wait_us(s->cookie, s->wait_interval_us)) { status = AdrenoHfiStartupWaitError; goto failed; }
+        }
+        if (!acknowledged) { status = AdrenoHfiStartupTimeout; goto failed; }
+    }
+    state->completed = 1;
+    r->stage = AdrenoHfiStageComplete;
+    return AdrenoHfiStartupSuccess;
+failed:
+    state->poisoned = 1;
+    h->poisoned = 1;
+    return status;
+}
+
 ShengGmuStatus ShengGmuColdStart(ShengGmuDevice *d, const ShengGmuConfig *c,
     const AdrenoHfiStartupConfig *config, const ShengGmuStartupLimits *limits, ShengGmuStartupResult *r)
 {
@@ -343,7 +415,7 @@ ShengGmuStatus ShengGmuColdStart(ShengGmuDevice *d, const ShengGmuConfig *c,
     ShengGmuStatus status = ShengGmuLoadAndStartHfi(d, c, &r->load);
     if (status != ShengGmuSuccess) return status;
     liuqin_gmu_trace("T15_HFI_STARTUP", config->gpu_count, config->bandwidth_count);
-    r->protocol_status = AdrenoHfiStartupRun(&d->startup, &d->hfi, config, &services, &r->protocol);
+    r->protocol_status = liuqin_hfi_startup_run(&d->startup, &d->hfi, config, &services, &r->protocol);
     if (r->protocol_status == AdrenoHfiStartupSuccess) return ShengGmuSuccess;
     switch (r->protocol_status) {
     case AdrenoHfiStartupClockError:
