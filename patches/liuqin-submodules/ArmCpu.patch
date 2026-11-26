@@ -1,0 +1,223 @@
+diff --git a/ArmCpu.cpp b/ArmCpu.cpp
+index 98b6c3c..cbb0a8a 100644
+--- a/ArmCpu.cpp
++++ b/ArmCpu.cpp
+@@ -3,6 +3,7 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOLocks.h>
++#include <IOKit/IOLib.h>
+ #include <libkern/c++/OSData.h>
+ #include <libkern/c++/OSSymbol.h>
+ #include <machine/machine_routines.h>
+@@ -14,6 +15,7 @@ extern "C" void rtclock_intr (unsigned int);
+ // Kernel-internal entries used for secondary CPU startup (Darwin 23 osfmk).
+ extern "C" vm_offset_t ml_static_vtop (vm_offset_t);
+ extern "C" char LowResetVectorBase[], LowResetVectorEnd[], ResetHandlerData[], const_boot_args[];
++extern "C" char bootstrap_pagetables[], cpu_ttep[], native_pac_keys[], start_cpu_paddr[], CpuDataEntries[];
+ extern "C" kern_return_t processor_start (processor_t);
+ extern "C" kern_return_t kernel_thread_start (void (*) (void *, wait_result_t), void *, thread_t *);
+ extern "C" void thread_deallocate (thread_t);
+@@ -30,7 +32,8 @@ volatile uint64_t armcpu_ipi_selftest_sent = 0;
+ // Boot core's own GIC registers read back once after enabling (own frame, the same one just written): 0 IGROUPR0, 1 ISENABLER0, 2 GICD_CTLR,
+ // 3 GICD_TYPER, 4 IGRPMODR0, 5 ICC_PMR_EL1, 6 ICC_IGRPEN1_EL1, 7 ICC_SRE_EL1.
+ volatile uint32_t armcpu_gic_boot[8];
+-volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   // per logical core: architectural timer interrupts and SGI 0 taken
++volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   // per logical core: architectural timer interrupts and IPI SGIs taken
++volatile uint32_t armcpu_sgi_mask = 0, armcpu_ipi_sgi = 0;  // NS Group-1 deliverable SGI bitmask and chosen IPI INTID
+ static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs are software-pended SPIs 1008+core routed to that core (ICC_SGI1R_EL1 generates nothing on this board)
+ static bool gSelfIpi = false;               // boot-arg armcpu-self-ipi=1: every core sends itself SGI 0 from initCPU
+ volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
+@@ -49,8 +52,18 @@ volatile uint32_t armcpu_smp_sys[8][5], armcpu_boot_sys[5];
+ volatile int32_t armcpu_smp_psci_rc[8];
+ }
+ 
++static void cleanToMemory (const void *start, size_t length);
++
+ #define ARMCPU_SMP_SLOTS 8
+ 
++/* Panel liveness marks while the debug console is down. Weak so kernels built
++ * without the liuqin debug mirror (every other board) link unchanged. */
++extern "C" void liuqin_fb_mark (unsigned, unsigned, uint32_t) __attribute__ ((weak));
++static inline void lq_mark (unsigned row, unsigned x, uint32_t color)
++{
++  if (liuqin_fb_mark) { liuqin_fb_mark (row, x, color); }
++}
++
+ class ArmCpu : public IOCPU {
+   OSDeclareDefaultStructors (ArmCpu)
+   OSSharedPtr<IOMemoryMap> distributor;
+@@ -493,8 +506,11 @@ bool ArmCpu::start (IOService *provider)
+   return true;
+ }
+ 
++static IOLock *gSmpRegisterLock = nullptr;
++
+ void ArmCpu::drainPending (void)
+ {
++  if (gSmpRegisterLock == nullptr) { gSmpRegisterLock = IOLockAlloc (); }
+   for (unsigned id = 1; id < ARMCPU_SMP_SLOTS; id++) {
+     ArmCpu *cpu = __atomic_exchange_n (&gPending[id], static_cast<ArmCpu *> (nullptr), __ATOMIC_ACQ_REL);
+     if (cpu != nullptr) { cpu->finishSecondary (); }
+@@ -507,16 +523,7 @@ bool ArmCpu::finishSecondary (void)
+   redistBase = gFrames;
+   redistSize = gFramesSize;
+   if (gRemoteGic && !wakeRedistributor (false)) { armcpu_smp_fail[logicalId] = 3; return false; }
+-  ml_processor_info_t info = {};
+-  info.cpu_id = this;
+-  info.phys_id = static_cast<uint32_t> (affinity);
+-  info.log_id = logicalId;
+-  info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (affinity)));
+-  info.cluster_type = clusterType (static_cast<uint32_t> (affinity));
+-  perfmon_interrupt_handler_func pmi = nullptr;
+-  kern_return_t status = ml_processor_register (&info, &machProcessor, &ipi_handler, &pmi);
+-  if (status != KERN_SUCCESS) { armcpu_smp_fail[logicalId] = 4; return false; }
+-  setCPUNumber (info.log_id);
++  setCPUNumber (logicalId);
+   armcpu_smp_step[logicalId] = 2;
+   setCPUState (kIOCPUStateUninitalized);
+   registerService ();
+@@ -558,6 +565,23 @@ void ArmCpu::startThread (void *argument, wait_result_t)
+ {
+   ArmCpu *self = static_cast<ArmCpu *> (argument);
+   armcpu_smp_step[self->logicalId] = 3;
++  // Stagger secondary core startup briefly so boot CPU finishes early registration cleanly.
++  IOSleep (1000 + (self->logicalId - 1) * 200);
++  ml_processor_info_t info = {};
++  info.cpu_id = self;
++  info.phys_id = static_cast<uint32_t> (self->affinity);
++  info.log_id = self->logicalId;
++  info.cluster_id = static_cast<uint32_t> (ml_get_cluster_number (static_cast<uint32_t> (self->affinity)));
++  info.cluster_type = clusterType (static_cast<uint32_t> (self->affinity));
++  perfmon_interrupt_handler_func pmi = nullptr;
++  IOLockLock (gSmpRegisterLock);
++  kern_return_t status = ml_processor_register (&info, &self->machProcessor, &self->ipi_handler, &pmi);
++  IOLockUnlock (gSmpRegisterLock);
++  if (status != KERN_SUCCESS) {
++    armcpu_smp_fail[self->logicalId] = 4;
++    thread_terminate (current_thread ());
++    return;
++  }
+   // Blocks until the new core reaches the scheduler; a core that never arrives only stalls this helper thread.
+   processor_start (self->machProcessor);
+   // Once every secondary core has started, the scheduler sets up its cluster edges (Edge migration and steal rules).
+@@ -580,6 +604,36 @@ void ArmCpu::startSecondary (void)
+   thread_deallocate (thread);
+ }
+ 
++static void selectGroup1Sgi (void)
++{
++  uint64_t mpidr, daif, v;
++  __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (mpidr));
++  if ((mpidr & 0xff) >= 16) { return; }
++  __asm__ volatile ("mrs %0, daif; msr daifset, #2; isb" : "=r" (daif) :: "memory");
++  const uint64_t base = ((mpidr & 0xff00000000ULL) << 16) | ((mpidr & 0xff0000) << 16) |
++                        ((mpidr & 0xff00) << 8) | (1ULL << (mpidr & 0xff));
++  uint32_t mask = 0;
++  for (uint32_t intid = 0; intid < 16; intid++) {
++    if ((armcpu_gic_boot[0] & (1U << intid)) == 0) { continue; }
++    const uint64_t sgi = base | (static_cast<uint64_t> (intid) << 24);
++    uint64_t h = 1023;
++    __asm__ volatile ("dsb ishst; msr icc_sgi1r_el1, %0; isb" :: "r" (sgi) : "memory");
++    for (unsigned polls = 0; polls < 400; polls++) {
++      __asm__ volatile ("mrs %0, icc_hppir1_el1" : "=r" (h));
++      if ((h & 0xffffff) == intid) { break; }
++      __asm__ volatile ("isb" ::: "memory");
++    }
++    if ((h & 0xffffff) == intid) {
++      mask |= (1U << intid);
++      __asm__ volatile ("mrs %0, icc_iar1_el1" : "=r" (v));
++      __asm__ volatile ("msr icc_eoir1_el1, %0; isb" :: "r" (v) : "memory");
++    }
++  }
++  armcpu_sgi_mask = mask;
++  armcpu_ipi_sgi = mask != 0 ? static_cast<uint32_t> (__builtin_ctz (mask)) : 0;
++  __asm__ volatile ("msr daif, %0; isb" :: "r" (daif) : "memory");
++}
++
+ void ArmCpu::initCPU (bool boot)
+ {
+   if (secondary) {
+@@ -600,7 +654,7 @@ void ArmCpu::initCPU (bool boot)
+     enableCPUTimeBase (true);
+     setCPUState (kIOCPUStateRunning);
+     armcpu_smp_step[logicalId] = 7;
+-    armcpu_smp_running = armcpu_smp_running + 1;
++    __atomic_add_fetch (&armcpu_smp_running, 1U, __ATOMIC_ACQ_REL);
+     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
+     // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
+     if (gSelfIpi) { signalCPU (this); }
+@@ -615,6 +669,7 @@ void ArmCpu::initCPU (bool boot)
+     return;
+   }
+   enableGic ();
++  selectGroup1Sgi ();
+   if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
+   enableCPUTimeBase (true);
+   setCPUState (kIOCPUStateRunning);
+@@ -629,6 +684,18 @@ void ArmCpu::dispatch (void *target, void *, void *, int)
+ 
+ void ArmCpu::interrupt (void)
+ {
++  /* A gray cell at row 266 advances once per 1024 IRQ entries: it shows that
++   * the CPU still takes interrupts at all when the timer cell stops. */
++  {
++    static unsigned long lq_irq_entries;
++
++    if ((++lq_irq_entries & 1023u) == 0) {
++      unsigned cell = static_cast<unsigned> ((lq_irq_entries >> 10) & 7u);
++
++      lq_mark (400, 128 + ((cell + 7) & 7u) * 48, 0xff000000);
++      lq_mark (400, 128 + cell * 48, 0xffa0a0a0);
++    }
++  }
+   unsigned drained=0;
+   for (;;) {
+     armcpu_irq_phase=1;
+@@ -650,7 +717,7 @@ void ArmCpu::interrupt (void)
+       armcpu_irq_phase=2;
+       rtclock_intr (0);
+       armcpu_irq_phase=3;
+-    } else if ((id & 0xffffff) == 0) {
++    } else if ((id & 0xffffff) == armcpu_ipi_sgi) {
+       armcpu_ipi_interrupts = armcpu_ipi_interrupts + 1;
+       armcpu_core_sgi[logicalId & 7] = armcpu_core_sgi[logicalId & 7] + 1;
+       armcpu_irq_phase=4;
+@@ -687,7 +754,8 @@ void ArmCpu::signalCPU (IOCPU *target)
+   }
+   uint64_t aff = peer->signalTarget ();
+   uint64_t sgi = ((aff & 0xff00000000ULL) << 16) | ((aff & 0xff0000) << 16) |
+-                 ((aff & 0xff00) << 8) | (1ULL << (aff & 0xff));
++                 ((aff & 0xff00) << 8) | (static_cast<uint64_t> (armcpu_ipi_sgi & 0xfU) << 24) |
++                 (1ULL << (aff & 0xff));
+   armcpu_ipi_sent = armcpu_ipi_sent + 1;
+   if (gSpiIpi) { spiIpiSend (gDist, peer->logicalId & 7); return; }
+   __asm__ volatile ("dsb ishst; msr icc_sgi1r_el1, %0; isb" :: "r" (sgi) : "memory");
+@@ -800,6 +868,7 @@ void ArmCpu::enableCPUTimeBase (bool enabled)
+ 
+ void ArmCpu::quiesceCPU (void)
+ {
++  lq_mark (424, 128, 0xffff0000);   /* quiesce disables CNTV and Group 1 IRQs */
+   armcpu_quiesce_calls=armcpu_quiesce_calls+1;
+   if(diagnosePower)panic("ArmCpu: unsupported quiesce requested before timer/GIC disable caller=%p halt=%u timer=%llu phase=%u",__builtin_return_address(0),armcpu_halt_calls,armcpu_timer_interrupts,armcpu_irq_phase);
+   enableCPUTimeBase (false);
+@@ -809,6 +878,7 @@ void ArmCpu::quiesceCPU (void)
+ 
+ void ArmCpu::haltCPU (void)
+ {
++  lq_mark (424, 176, 0xffff8000);   /* halt goes on to stop the CPU */
+   armcpu_halt_calls=armcpu_halt_calls+1;
+   quiesceCPU ();
+   setCPUState (kIOCPUStateStopped);
+@@ -841,6 +911,11 @@ kern_return_t ArmCpu::startCPU (vm_offset_t, vm_offset_t)
+   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
+   cleanToMemory (ResetHandlerData, 0x1000);
+   cleanToMemory (const_boot_args, 0x1000);
++  cleanToMemory (bootstrap_pagetables, 0x10000);
++  cleanToMemory (cpu_ttep, 0x40);
++  cleanToMemory (native_pac_keys, 0x100);
++  cleanToMemory (start_cpu_paddr, 0x40);
++  cleanToMemory (CpuDataEntries, 0x100);
+   armcpu_smp_step[logicalId] = 4;
+   int64_t result = psciCall (hvc, 0xc4000003ULL, affinity & 0xff00ffffffULL, entry, 0);
+   armcpu_smp_psci_rc[logicalId] = static_cast<int32_t> (result);

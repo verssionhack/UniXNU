@@ -1,0 +1,297 @@
+diff --git a/README.md b/README.md
+index 86e2510..23cd219 100644
+--- a/README.md
++++ b/README.md
+@@ -32,6 +32,14 @@ binding in `native_original_branches`. Builders must not subtract a cached
+ native-text slide. Stale targets, missing stubs and out-of-range branches stop
+ emission. Absolute data pointers in GOT entries retain their collection values.
+ The native input executable is unchanged.
++Direct native `B`/`BL` instructions to retained `N_ABS` function symbols are
++also retargeted after placement. The emitter decodes the standalone branch,
++checks that its destination is retained executable code, and writes the final
++instruction with a displacement from its placed address. The report lists
++these sites in `native_absolute_branches`.
++Authenticated vtable pointers to retained `N_ABS` symbols that lack standalone
++chain-start records are added to the rebuilt fileset chain. The prelink report
++counts them as `native_split_relocations.absolute_pointers_added`.
+ 
+ Maps carry a matcher version as well as input hashes. The integrated CLI
+ regenerates outdated caches. Reviewed symbol anchors in `fixtures/` include
+diff --git a/fileset_emit.py b/fileset_emit.py
+index a82ddaf..181455b 100755
+--- a/fileset_emit.py
++++ b/fileset_emit.py
+@@ -525,6 +525,16 @@ class Emit:
+         struct.pack_into('<I', self.data, segment['fileoff'] + use_offset, (use & 0xffc003ff) | (low << 10))
+         self.report['adrp_pairs_rebound'] += 1
+ 
++    def match_entry_cpusubtype(self, at):
++        """Copy the root fileset's cpusubtype into the com.apple.kernel entry header.
++
++        DarwinBoot requires the two to be equal, and Apple's linker emits both from one
++        arm64e ABI. ld64.lld stamps the native kernel 0x80000002 while the collection uses
++        0xC0000002, so the entry takes the collection's capability bits.
++        """
++        subtype, = struct.unpack_from('<I', self.data, 8)
++        struct.pack_into('<I', self.data, at + 8, subtype)
++
+     def patch_entry_header(self):
+         """Rebase the copied native kernel header: slide vmaddrs, shift file offsets."""
+         at = self.fileoff
+@@ -580,6 +590,7 @@ class Emit:
+         if len(payload) + 32 > first:
+             raise ValueError('Rebuilt entry header overruns its payload')
+         self.data[at + 32:at + first] = payload + bytes(first - 32 - len(payload))
++        self.match_entry_cpusubtype(at)
+         struct.pack_into('<II', self.data, at + 16, len(rebuilt), len(payload))
+         flags, = struct.unpack_from('<I', self.data, at + 24)
+         struct.pack_into('<I', self.data, at + 24, flags | MH_DYLIB_IN_CACHE)
+@@ -730,6 +741,7 @@ def emit_images(raw, native_data, payload, roots, stub_symbol=None, early_securi
+         'collection_base': hex(cache.base), 'collection_slide': hex(collection_slide),
+         'native_link_address': hex(native.base), 'statistics': dict(emit.report),
+         'native_original_branches': emit.original_branches,
++        'native_absolute_branches': emit.absolute_branches,
+         'missing': {owner: {hex(target): count for target, count in sorted(targets.items())}
+                     for owner, targets in sorted(emit.missing.items())},
+         'stubbed': {owner: {hex(target): count for target, count in sorted(targets.items())}
+diff --git a/fileset_layout.py b/fileset_layout.py
+index 28b899d..0e3a48c 100644
+--- a/fileset_layout.py
++++ b/fileset_layout.py
+@@ -260,6 +260,59 @@ def relocate_original_stubs(data, layout):
+     return result
+ 
+ 
++def relocate_absolute_branches(data, layout):
++    """Retarget direct branches from native text to retained N_ABS functions.
++
++    A branch to an absolute linker symbol has no split-segment relocation. Its
++    immediate is correct in the standalone executable but becomes wrong when
++    the native text moves within the fileset. Decode the standalone instruction
++    and recompute its immediate from the placed site; never reuse a slide from
++    another build.
++    """
++    from kc_image import signed
++    native = layout.native
++    targets = {}
++    for name, address in native.absolute_symbols().items():
++        if name.endswith('.original'):
++            continue  # The BTI/B adapter has its own stricter check above.
++        targets.setdefault(address, []).append(name)
++    text_sections = [s for s in native.sections
++                     if s['segment'] == '__TEXT_EXEC' and s['name'] == '__text']
++    if len(text_sections) != 1:
++        raise ValueError('Expected one native executable text section')
++    section = text_sections[0]
++    code = native.read(section['va'], section['size'])
++    result = []
++    for offset in range(0, len(code) - 3, 4):
++        old_site = section['va'] + offset
++        word, = struct.unpack_from('<I', code, offset)
++        opcode = word & 0xfc000000
++        if opcode not in (0x14000000, 0x94000000):
++            continue
++        old_target = old_site + signed(word & 0x3ffffff, 26) * 4
++        names = targets.get(old_target)
++        if not names:
++            continue
++        owners = [owner for begin, end, owner in layout.retained_code
++                  if begin <= old_target < end]
++        if len(owners) != 1:
++            raise ValueError(f'Absolute branch target is not retained executable code: '
++                             f'{old_site:#x} -> {old_target:#x} ({names})')
++        new_site = layout.translate(old_site)
++        displacement = old_target - new_site
++        if displacement % 4 or not -(1 << 27) <= displacement < 1 << 27:
++            raise ValueError(f'Absolute branch out of range: {old_site:#x} -> {old_target:#x}')
++        rewritten = opcode | ((displacement >> 2) & 0x3ffffff)
++        struct.pack_into('<I', data, new_site - layout.cache.base, rewritten)
++        decoded = new_site + signed(rewritten & 0x3ffffff, 26) * 4
++        if decoded != old_target:
++            raise ValueError(f'Absolute branch verification failed at {new_site:#x}')
++        result.append(dict(source=hex(new_site), target=hex(old_target),
++                           symbols=sorted(names), owner=owners[0],
++                           operation='BL' if opcode == 0x94000000 else 'B'))
++    return result
++
++
+ def relocate_native(data, layout):
+     """Apply exact linker records, retaining PAC metadata for the root chain writer."""
+     from kc_image import signed
+@@ -330,4 +383,29 @@ def relocate_native(data, layout):
+         if new_site not in pointers:
+             pointers[new_site] = (layout.translate(pointer[0]),) + pointer[1:]
+             counts['pointers_without_split_record'] += 1
++    # ld64 can encode authenticated pointers to N_ABS symbols in a native
++    # vtable without adding those sites to the standalone chain starts. The
++    # copied word is an encoded pointer, not a usable runtime VA; include it
++    # in the rebuilt root chain so dyld rebases/authenticates it.
++    absolute = set(native.absolute_symbols().values())
++    for section in native.sections:
++        if section['segment'] != '__DATA_CONST' or section['va'] % 8:
++            continue
++        blob = native.read(section['va'], section['size'])
++        for offset in range(0, len(blob) - 7, 8):
++            word, = struct.unpack_from('<Q', blob, offset)
++            if not word >> 63 or word >> 62 & 1:
++                continue
++            target = base + (word & 0xffffffff)
++            if target not in absolute:
++                continue
++            site = section['va'] + offset
++            new_site = layout.translate(site)
++            if site in fixups or new_site in pointers:
++                continue
++            if not any(begin <= target < end for begin, end in layout.occupied):
++                raise ValueError(f'Absolute pointer target is not retained: {site:#x} -> {target:#x}')
++            pointers[new_site] = (target, 1, (word >> 49) & 3,
++                                  (word >> 32) & 0xffff, (word >> 48) & 1)
++            counts['absolute_pointers_added'] += 1
+     return pointers, counts
+diff --git a/fileset_segmented.py b/fileset_segmented.py
+index 994b116..e9703f1 100644
+--- a/fileset_segmented.py
++++ b/fileset_segmented.py
+@@ -7,7 +7,7 @@ import struct
+ from fileset_emit import (Emit, ChainReader, decode, chain_word, PAGE, MASK64,
+                           LC_SEGMENT_64, LC_SYMTAB, LC_DYLD_CHAINED_FIXUPS,
+                           LC_FILESET_ENTRY, LC_UNIXTHREAD, MH_DYLIB_IN_CACHE)
+-from fileset_layout import Layout, relocate_native, relocate_original_stubs, encode_uleb, align
++from fileset_layout import Layout, relocate_native, relocate_original_stubs, relocate_absolute_branches, encode_uleb, align
+ from kc_image import Image, scan, signed
+ from fileset_emit import inline_data_ranges, inside
+ 
+@@ -60,7 +60,9 @@ class SegmentedEmit(Emit):
+     def rewrite_native_chains(self):
+         self.native_pointers, counts = relocate_native(self.data, self.layout)
+         self.original_branches = relocate_original_stubs(self.data, self.layout)
++        self.absolute_branches = relocate_absolute_branches(self.data, self.layout)
+         self.report['native_original_branches_rebound'] = len(self.original_branches)
++        self.report['native_absolute_branches_rebound'] = len(self.absolute_branches)
+         self.report['native_split_relocations'] = dict(counts)
+         self.report['native_chain_sites'] = len(self.native_pointers)
+ 
+@@ -282,12 +284,18 @@ class SegmentedEmit(Emit):
+         if len(commands) > oldsize:
+             raise ValueError('Native load commands exceed available header space')
+         self.data[self.fileoff+32:self.fileoff+32+oldsize] = commands + bytes(oldsize-len(commands))
++        self.match_entry_cpusubtype(self.fileoff)
+         struct.pack_into('<II', self.data, self.fileoff+16, len(rebuilt), len(commands))
+         flags, = struct.unpack_from('<I', self.data, self.fileoff+24)
+         struct.pack_into('<I', self.data, self.fileoff+24, flags | MH_DYLIB_IN_CACHE)
+         # corecrypto authenticates the relocated __text bytes in a fileset.
+         code = next(s for s in self.native.sections if s['segment'] == '__TEXT_EXEC' and s['name'] == '__text')
+         seals = [s for s in self.native.sections if s['name'] == '__fips_hmacs']
++        if not seals and self.closure is not None and 'com.apple.kec.corecrypto' in self.closure:
++            # The prelinked crypto bootstrap has no source provider in the native kernel.
++            # Its retained original component is checked and resealed by seal_components().
++            self.report['corecrypto_hmac_sha256'] = None
++            return
+         if len(seals) != 1 or seals[0]['size'] != 32:
+             raise ValueError('Expected one 32-byte corecrypto HMAC field')
+         code_at = self.layout.translate(code['va']) - self.cache.base
+@@ -322,6 +330,9 @@ class SegmentedEmit(Emit):
+             self.data[seal_at:seal_at + 32] = digest
+             sealed[name] = digest.hex()
+         self.report['component_hmacs'] = sealed
++        native_seals = [s for s in self.native.sections if s['name'] == '__fips_hmacs']
++        if not native_seals and 'com.apple.kec.corecrypto' not in sealed:
++            raise ValueError('Original corecrypto HMAC was not verified and resealed')
+ 
+     def patch_headers(self):
+         rebuilt = []
+diff --git a/test_fileset_emit.py b/test_fileset_emit.py
+index d3ffe3e..25b4ccb 100644
+--- a/test_fileset_emit.py
++++ b/test_fileset_emit.py
+@@ -111,6 +111,21 @@ class FilesetEmitTests(unittest.TestCase):
+                     for i, v in enumerate(dysymtab)]
+         self.assertEqual(actual, expected)
+ 
++    def test_entry_cpusubtype_matches_the_fileset_root(self):
++        base, at = 0x100000000, 0x8000
++        segment = struct.pack('<II16sQQQQIIII', 0x19, 72, b'__TEXT',
++                              base, 0x4000, 0, 0x4000, 7, 5, 0, 0)
++        raw = bytearray(0x4000)
++        raw[:32 + len(segment)] = struct.pack(
++            '<8I', 0xfeedfacf, 0x100000c, 0x80000002, 2, 1, len(segment), 0, 0) + segment
++        emit = Emit.__new__(Emit)
++        emit.native = Image(bytes(raw))
++        emit.fileoff, emit.slide = at, 0
++        emit.data = bytearray(at) + raw
++        struct.pack_into('<I', emit.data, 8, 0xc0000002)
++        emit.patch_entry_header()
++        self.assertEqual(struct.unpack_from('<I', emit.data, at + 8)[0], 0xc0000002)
++
+     def test_adrp_preserves_signed_high_immediate_bits(self):
+         for immediate in (0x34567, 0xb4567, -0x34567):
+             with self.subTest(immediate=immediate):
+diff --git a/test_fileset_layout.py b/test_fileset_layout.py
+index ed6b661..8e2fe0c 100644
+--- a/test_fileset_layout.py
++++ b/test_fileset_layout.py
+@@ -3,7 +3,7 @@ import struct
+ from types import SimpleNamespace
+ import unittest
+ 
+-from fileset_layout import split_references, encode_uleb, relocate_native, relocate_original_stubs, Layout
++from fileset_layout import split_references, encode_uleb, relocate_native, relocate_original_stubs, relocate_absolute_branches, Layout
+ 
+ 
+ def records(groups):
+@@ -26,6 +26,43 @@ def image_fixture(blob):
+ 
+ 
+ class SplitSegmentTests(unittest.TestCase):
++    def test_direct_absolute_branch_is_retargeted_after_placement(self):
++        from kc_image import signed
++        old, new, target = 0x1000, 0x2000, 0x8000
++        words = struct.pack('<2I', 0x94000000 | ((target-old)//4),
++                            0x14000000 | ((target-old-4)//4))
++        native = SimpleNamespace(
++            sections=[dict(segment='__TEXT_EXEC', name='__text', va=old, size=8)],
++            absolute_symbols=lambda: {'_family_ctor': target, '_adapter.original': target},
++            read=lambda address, length: words[address-old:address-old+length])
++        layout = SimpleNamespace(native=native, cache=SimpleNamespace(base=0),
++                                 retained_code=[(target, target+0x100, 'family')],
++                                 translate=lambda address: new+address-old)
++        output = bytearray(new+8)
++        found = relocate_absolute_branches(output, layout)
++        self.assertEqual(len(found), 2)
++        for offset in (0, 4):
++            word, = struct.unpack_from('<I', output, new+offset)
++            self.assertEqual(new+offset+signed(word & 0x3ffffff, 26)*4, target)
++        layout.retained_code = []
++        with self.assertRaisesRegex(ValueError, 'not retained executable'):
++            relocate_absolute_branches(output, layout)
++
++    def test_unchained_absolute_vtable_pointer_joins_rebuilt_chain(self):
++        source, placed, target, base = 0x2000, 0x4000, 0x8000, 0x1000
++        raw = (1 << 63) | (0x1234 << 32) | (target - base)
++        native = image_fixture(records([]))
++        native.sections = [dict(segment='__DATA_CONST', va=source, size=12)]
++        native.fixups = lambda: {}
++        native.absolute_symbols = lambda: {'_family_method': target}
++        native.read = lambda address, length: struct.pack('<Q', raw) + bytes(4)
++        layout = SimpleNamespace(native=native, cache=SimpleNamespace(base=base),
++                                 occupied=[(target, target+0x100)],
++                                 translate=lambda address: placed+address-source)
++        pointers, counts = relocate_native(bytearray(0x5000), layout)
++        self.assertEqual(pointers[placed], (target, 1, 0, 0x1234, 0))
++        self.assertEqual(counts['absolute_pointers_added'], 1)
++
+     def original_stub(self, target=0x8000, moved=0x20000, branch_target=None):
+         stub = 0x1000
+         actual = target if branch_target is None else branch_target
+@@ -92,8 +129,10 @@ class SplitSegmentTests(unittest.TestCase):
+         source, target = 0x10000, 0x20000
+         blob = records([(1, 2, [(0, [(7, [0])])])])
+         native = image_fixture(blob)
+-        native.sections = [dict(va=source), dict(va=target)]
++        native.sections = [dict(va=source, segment='__TEXT_EXEC', size=4),
++                           dict(va=target, segment='__TEXT_EXEC', size=4)]
+         native.fixups = lambda: {}
++        native.absolute_symbols = lambda: {}
+         word = 0x94000000 | ((target-source)//4)
+         native.read = lambda a, n: struct.pack('<I', word)
+         layout = SimpleNamespace(native=native, cache=SimpleNamespace(base=0),

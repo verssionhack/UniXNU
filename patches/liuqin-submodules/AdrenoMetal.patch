@@ -1,0 +1,68 @@
+diff --git a/IOGPUMetalDeviceShim.h b/IOGPUMetalDeviceShim.h
+index 50b721e..ecaeecc 100644
+--- a/IOGPUMetalDeviceShim.h
++++ b/IOGPUMetalDeviceShim.h
+@@ -37,10 +37,14 @@ static uint32_t one(id, SEL) { return 1; }
+ static void nothing(id, SEL) {}
+ static void nothingWith(id, SEL, uint64_t) {}
+ static BOOL amplificationCount(id, SEL, NSUInteger count) { return count == 1; }
+-static uint64_t commandBufferArgumentsSize(id, SEL) { return 48; }   // IOGPU's
++static uint32_t commandBufferArgumentsSize(id, SEL) { return 48; }   // IOGPU's (26C5035r: unsigned int)
+ // Unified memory: two thirds of RAM, as Metal recommends on Apple GPUs.
+ static uint64_t workingSetSize(id, SEL) { return NSProcessInfo.processInfo.physicalMemory / 3 * 2; }
+ static uint64_t stub(id, SEL) { return 0; }
++static float stubFloat(id, SEL) { return 0.0f; }
++static double stubDouble(id, SEL) { return 0.0; }
++struct StubZeroPair { uint64_t a, b; };
++static StubZeroPair stubPair(id, SEL) { return {0, 0}; }
+ 
+ // The frontend's classes and the IOGPU class each stands in for; the device is any other class.
+ static Class referenceClass(Class cls)
+@@ -67,8 +71,18 @@ static BOOL resolveStub(id cls, SEL, SEL selector)
+     Method method = reference ? class_getInstanceMethod(reference, selector) : nullptr;
+     if (!method)
+         return NO;
+-    fprintf(stderr, "NativeAdrenoMetal: %s: stubbed %s %s\n", getprogname(), class_getName((Class)cls), sel_getName(selector));
+-    return class_addMethod((Class)cls, selector, (IMP)stub, method_getTypeEncoding(method));
++    const char *enc = method_getTypeEncoding(method);
++    const char *ret = enc;
++    while (ret && (*ret == 'r' || *ret == 'n' || *ret == 'N' || *ret == 'o' || *ret == 'O' || *ret == 'R' || *ret == 'V'))
++        ++ret;
++    IMP imp = (IMP)stub;
++    if (ret) {
++        if (*ret == 'f') imp = (IMP)stubFloat;
++        else if (*ret == 'd') imp = (IMP)stubDouble;
++        else if (*ret == '{') imp = (IMP)stubPair;
++    }
++    fprintf(stderr, "NativeAdrenoMetal: %s: stubbed %s %s (%s)\n", getprogname(), class_getName((Class)cls), sel_getName(selector), enc ? enc : "?");
++    return class_addMethod((Class)cls, selector, imp, enc);
+ }
+ 
+ // IOGPUMetalCommandQueue's GPU priorities (MTLGPUPriority 0-5; IOGPU starts a queue at 1, its background priority at 2), kept on the queue.
+@@ -90,7 +104,7 @@ static BOOL setGPUPriority(id self, SEL, NSUInteger priority)
+     setPriorities(self, priority, getBackgroundGPUPriority(self, nullptr));
+     return YES;
+ }
+-static BOOL setGPUPriorityOffset(id self, SEL, NSUInteger priority, NSUInteger) { return setGPUPriority(self, nullptr, priority); }
++static BOOL setGPUPriorityOffset(id self, SEL, NSUInteger priority, unsigned short) { return setGPUPriority(self, nullptr, priority); }
+ static BOOL setBothGPUPriorities(id self, SEL, NSUInteger priority, NSUInteger background)
+ {
+     setPriorities(self, priority, background);
+@@ -174,7 +188,7 @@ static void install(id device, io_service_t port)
+         {"peerCount", (IMP)one, "I16@0:8", false},
+         {"dedicatedMemorySize", (IMP)zero, "Q16@0:8", false},
+         {"hwResourcePoolCount", (IMP)zero, "I16@0:8", false},
+-        {"cmdBufArgsSize", (IMP)commandBufferArgumentsSize, "Q16@0:8", false},
++        {"cmdBufArgsSize", (IMP)commandBufferArgumentsSize, "I16@0:8", false},
+         {"kickCleanupQueue", (IMP)nothing, "v16@0:8", false},
+         {"updateGPUSelectionProperties", (IMP)nothing, "v16@0:8", false},
+         {"updateResourcePoolPurgeability", (IMP)nothing, "v16@0:8", false},
+@@ -194,7 +208,7 @@ static void install(id device, io_service_t port)
+         {"getGPUPriority", (IMP)getGPUPriority, "Q16@0:8", false},
+         {"getBackgroundGPUPriority", (IMP)getBackgroundGPUPriority, "Q16@0:8", false},
+         {"setGPUPriority:", (IMP)setGPUPriority, "B24@0:8Q16", false},
+-        {"setGPUPriority:offset:", (IMP)setGPUPriorityOffset, "B32@0:8Q16Q24", false},
++        {"setGPUPriority:offset:", (IMP)setGPUPriorityOffset, "B28@0:8Q16S24", false},
+         {"_setGPUPriority:backgroundPriority:", (IMP)setBothGPUPriorities, "B32@0:8Q16Q24", false},
+     };
+     if (Class queue = objc_getClass("NBQueue"))
